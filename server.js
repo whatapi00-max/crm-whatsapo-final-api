@@ -144,9 +144,9 @@ class TenantWAManager {
           '--disable-sync', '--disable-translate', '--hide-scrollbars',
           '--metrics-recording-only', '--mute-audio', '--no-default-browser-check',
           '--safebrowsing-disable-auto-update',
-          '--single-process', '--no-zygote',
+          '--no-zygote',
           '--disable-software-rasterizer', '--disable-features=site-per-process',
-          '--js-flags=--max-old-space-size=256'
+          '--js-flags=--max-old-space-size=128'
         ],
         timeout: 90000
       }
@@ -409,7 +409,7 @@ class TenantWAManager {
       .select('id, phone, wa_jid, real_phone')
       .eq('tenant_id', tenantId)
       .or('real_phone.is.null,real_phone.eq.')
-      .limit(50);
+      .limit(10);
 
     if (!leads || leads.length === 0) return;
     console.log(`🔍 [Tenant ${tid}] Bulk resolving real phones for ${leads.length} leads...`);
@@ -428,7 +428,7 @@ class TenantWAManager {
           }
         }
       } catch (_) {}
-      await delay(500);
+      await delay(2000);
     }
     console.log(`✅ [Tenant ${tid}] Bulk resolved ${resolved}/${leads.length} phone numbers`);
   }
@@ -1159,7 +1159,17 @@ app.post('/api/admin/storage/cleanup-orphans', adminAuth, async (req, res) => {
 // ══════════════════════════════════════════════
 
 // ── Health / Status ─────────────────────────
-app.get('/api/health', tenantAuth, (req, res) => {
+// Public health check (used by Render to verify the service is alive)
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    uptime: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Tenant-specific health (requires auth)
+app.get('/api/tenant-health', tenantAuth, (req, res) => {
   const status = waManager.getStatus(req.tenantId);
   res.json({
     status: 'ok', whatsapp: status,
@@ -1889,4 +1899,9 @@ process.on('SIGINT', async () => {
 
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err.message);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err.message);
+  // Don't exit — keep the server alive
 });
