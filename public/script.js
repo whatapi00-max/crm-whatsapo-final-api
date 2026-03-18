@@ -355,6 +355,7 @@ async function checkConnection() {
       if (sText) { sText.textContent = 'Number Banned'; sText.className = 'text-sm text-red-500 font-semibold'; }
       if (statusSel) statusSel.value = 'banned';
       $('#qr-overlay').classList.remove('hidden');
+      updateOverlayContent('banned');
     } else if (data.ready) {
       dot.className = 'w-3 h-3 rounded-full bg-wa-green block';
       dot.style.animation = 'pulse-green 2s infinite';
@@ -366,6 +367,15 @@ async function checkConnection() {
       $('#qr-overlay').classList.add('hidden');
       const qrSection = $('#qr-section');
       if (qrSection) qrSection.classList.add('hidden');
+    } else if (data.initializing || data.status === 'initializing') {
+      // Server is reconnecting WhatsApp — show friendly message
+      dot.className = 'w-3 h-3 rounded-full bg-yellow-400 animate-pulse block';
+      text.textContent = 'Reconnecting...';
+      text.className = 'text-[11px] text-yellow-400 opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap';
+      if (sDot) { sDot.className = 'w-3 h-3 rounded-full bg-yellow-400 animate-pulse'; }
+      if (sText) { sText.textContent = 'Reconnecting...'; sText.className = 'text-sm text-yellow-400 font-semibold'; }
+      $('#qr-overlay').classList.remove('hidden');
+      updateOverlayContent('initializing');
     } else {
       // Not connected - show "contact admin" overlay
       dot.className = 'w-3 h-3 rounded-full bg-red-500 animate-pulse block';
@@ -374,6 +384,7 @@ async function checkConnection() {
       if (sText) { sText.textContent = 'Not Connected'; sText.className = 'text-sm text-red-400'; }
       if (statusSel) statusSel.value = 'connected';
       $('#qr-overlay').classList.remove('hidden');
+      updateOverlayContent('disconnected');
     }
   } catch (err) {
     if (err.message && err.message.includes('401')) {
@@ -382,6 +393,26 @@ async function checkConnection() {
     }
     $('#connection-dot').className = 'w-3 h-3 rounded-full bg-red-500 animate-pulse block';
     $('#connection-text').textContent = 'Server offline';
+  }
+}
+
+function updateOverlayContent(state) {
+  const overlay = $('#qr-overlay');
+  if (!overlay) return;
+  const titleEl = overlay.querySelector('h2');
+  const subtitleEl = overlay.querySelector('h2 + p');
+  const iconArea = overlay.querySelector('.text-center');
+  if (state === 'initializing') {
+    if (titleEl) titleEl.textContent = 'Reconnecting WhatsApp...';
+    if (subtitleEl) { subtitleEl.textContent = 'Please wait a moment'; subtitleEl.className = 'text-xs text-yellow-400 font-medium'; }
+    if (iconArea) iconArea.innerHTML = '<svg class="w-12 h-12 text-yellow-400 mx-auto mb-3 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg><p class="text-sm text-gray-400">Server is reconnecting your<br>WhatsApp session...</p>';
+  } else if (state === 'banned') {
+    if (titleEl) titleEl.textContent = 'WhatsApp Number Banned';
+    if (subtitleEl) { subtitleEl.textContent = 'Contact your administrator'; subtitleEl.className = 'text-xs text-red-400 font-medium'; }
+  } else {
+    if (titleEl) titleEl.textContent = 'WhatsApp Not Connected';
+    if (subtitleEl) { subtitleEl.textContent = 'Contact your administrator'; subtitleEl.className = 'text-xs text-yellow-400 font-medium'; }
+    if (iconArea) iconArea.innerHTML = '<svg class="w-12 h-12 text-gray-600 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"/></svg><p class="text-sm text-gray-500">Waiting for admin to<br>connect your WhatsApp</p>';
   }
 }
 

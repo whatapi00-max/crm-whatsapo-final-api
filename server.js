@@ -162,6 +162,18 @@ class TenantWAManager {
       const msgStr = String(msg || '').toUpperCase();
       if (msgStr.includes('401') || msgStr.includes('CONFLICT') || msgStr.includes('BANNED')) {
         state.manualStatus = 'banned';
+      } else {
+        // Session likely corrupted (e.g. sudden power loss) — clean up and retry
+        console.log(`🔄 [Tenant ${tid}] Auth failure (possibly corrupted session), cleaning up and retrying in 10s...`);
+        setTimeout(async () => {
+          try {
+            await this.destroyClient(tenantId);
+            await this.cleanupSessionFiles(tenantId);
+            await this.initClient(tenantId);
+          } catch (e) {
+            console.error(`❌ [Tenant ${tid}] Session cleanup retry failed:`, e.message);
+          }
+        }, 10000);
       }
     });
 
@@ -1069,7 +1081,13 @@ app.get('/api/health', tenantAuth, (req, res) => {
 app.get('/api/qr-status', tenantAuth, (req, res) => {
   const status = waManager.getStatus(req.tenantId);
   const qr = waManager.getQR(req.tenantId);
-  res.json({ ready: status === 'connected', qr, banned: status === 'banned', status });
+  res.json({
+    ready: status === 'connected',
+    qr,
+    banned: status === 'banned',
+    initializing: status === 'initializing',
+    status
+  });
 });
 
 app.get('/api/qr-image', tenantAuth, async (req, res) => {
@@ -1718,10 +1736,11 @@ app.get('/', (req, res) => {
 });
 
 app.get('/login', (req, res) => {
+  // If user explicitly visits /login, clear their session and show login page
+  // This prevents the redirect loop when marketer is stuck on "contact admin" screen
   const decoded = verifyToken(req);
   if (decoded) {
-    if (decoded.role === 'admin') return res.redirect('/admin');
-    return res.redirect('/crm');
+    res.clearCookie('crm_token');
   }
   res.sendFile(path.join(__dirname, 'public', 'login.html'));
 });
