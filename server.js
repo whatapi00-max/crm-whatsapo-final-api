@@ -59,9 +59,9 @@ function isDuplicate(tenantId, msgId) {
   const s = processedMsgIds.get(tenantId);
   if (s.has(msgId)) return true;
   s.add(msgId);
-  if (s.size > 5000) {
+  if (s.size > 1000) {
     const arr = [...s];
-    arr.slice(0, 2500).forEach(id => s.delete(id));
+    arr.slice(0, 500).forEach(id => s.delete(id));
   }
   return false;
 }
@@ -146,9 +146,15 @@ class TenantWAManager {
           '--safebrowsing-disable-auto-update',
           '--no-zygote',
           '--disable-software-rasterizer', '--disable-features=site-per-process',
-          '--js-flags=--max-old-space-size=128'
+          '--disable-component-update',
+          '--disable-domain-reliability',
+          '--disable-print-preview',
+          '--disable-speech-api',
+          '--disk-cache-size=0',
+          '--media-cache-size=0',
+          '--js-flags=--max-old-space-size=64 --lite-mode --optimize-for-size --gc-interval=100'
         ],
-        timeout: 90000
+        timeout: 60000
       }
     });
 
@@ -168,7 +174,7 @@ class TenantWAManager {
       state.initializing = false;
       console.log(`✅ [Tenant ${tid}] WhatsApp client READY`);
       this.startScheduledChecker(tenantId);
-      this.bulkResolveRealPhones(tenantId).catch(e => console.error(`⚠️  [Tenant ${tid}] Bulk resolve error:`, e.message));
+      // Skip bulkResolveRealPhones to save memory on 512MB instances
     });
 
     client.on('authenticated', () => {
@@ -292,15 +298,8 @@ class TenantWAManager {
         const { data: existingLead } = await supabase.from('leads')
           .select('id, phone').eq('tenant_id', tenantId).eq('phone', phone).maybeSingle();
 
-        // Resolve real phone number from contact
-        let realPhone = null;
-        try {
-          const contact = await msg.getContact();
-          if (contact?.number) {
-            const num = contact.number.replace(/\D/g, '');
-            if (num) realPhone = num;
-          }
-        } catch (_) {}
+        // Use phone from JID directly (skip getContact to save memory)
+        const realPhone = phone;
 
         const isNew = !existingLead;
         if (!existingLead) {

@@ -43,4 +43,4 @@ EXPOSE 3000
 
 # Use dumb-init for proper signal handling
 ENTRYPOINT ["dumb-init", "--"]
-CMD ["node", "--max-old-space-size=384", "server.js"]
+CMD ["node", "--max-old-space-size=256", "--optimize-for-size", "--gc-interval=100", "server.js"]
