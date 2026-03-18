@@ -18,7 +18,6 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
-const { execSync } = require('child_process');
 
 // ── Config ──────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -129,8 +128,7 @@ class TenantWAManager {
       await this.destroyClient(tenantId);
     }
 
-    // Kill any orphaned chromium processes and remove lock files
-    this._killOrphanedBrowsers(tid);
+    // Remove stale browser lock files before starting
     this._removeBrowserLockSync(tid);
 
     const client = new Client({
@@ -154,7 +152,7 @@ class TenantWAManager {
       }
     });
 
-    const state = { client, ready: false, qrCode: null, manualStatus: null, scheduledInterval: null, initializing: true };
+    const state = { client, ready: false, qrCode: null, manualStatus: null, scheduledInterval: null, initializing: true, browserPid: null };
     this.clients.set(tid, state);
 
     client.on('qr', (qr) => {
@@ -176,6 +174,11 @@ class TenantWAManager {
     client.on('authenticated', () => {
       state.initializing = false;
       console.log(`🔐 [Tenant ${tid}] WhatsApp authenticated`);
+      // Capture browser PID for safe cleanup later
+      try {
+        const proc = client.pupBrowser?.process();
+        if (proc) state.browserPid = proc.pid;
+      } catch (_) {}
     });
 
     client.on('auth_failure', (msg) => {
@@ -236,8 +239,12 @@ class TenantWAManager {
         setTimeout(() => reject(new Error('Client init timed out')), INIT_TIMEOUT_MS)
       )
     ]).then(() => {
-      // Success — reset retry counter
+      // Success — reset retry counter and capture browser PID
       this._retryCounts.delete(tid);
+      try {
+        const proc = client.pupBrowser?.process();
+        if (proc) state.browserPid = proc.pid;
+      } catch (_) {}
     }).catch(async (err) => {
       console.error(`❌ [Tenant ${tid}] Init error (attempt ${retryCount + 1}/${MAX_RETRIES}): ${err.message}`);
       state.initializing = false;
@@ -469,7 +476,6 @@ class TenantWAManager {
     const tid = String(tenantId);
     const state = this.clients.get(tid);
     if (!state) {
-      this._killOrphanedBrowsers(tid);
       this._removeBrowserLockSync(tid);
       return;
     }
@@ -485,7 +491,7 @@ class TenantWAManager {
       console.log(`⚠️  [Tenant ${tid}] Graceful destroy failed: ${e.message}`);
     }
 
-    // 2. Force-kill the underlying browser process via puppeteer handle
+    // 2. Force-kill the specific browser process by PID (safe — only kills THIS tenant's browser)
     try {
       const browser = state.client?.pupBrowser;
       if (browser) {
@@ -495,32 +501,19 @@ class TenantWAManager {
         }
       }
     } catch (_) {}
+    if (state.browserPid) {
+      try { process.kill(state.browserPid, 'SIGKILL'); } catch (_) {}
+    }
 
     this.clients.delete(tid);
 
-    // 3. Kill any orphaned chromium processes for this tenant
-    this._killOrphanedBrowsers(tid);
-
-    // 4. Wait for processes to fully die
+    // 3. Wait for process to fully die
     await new Promise(r => setTimeout(r, 2000));
 
-    // 5. Remove stale browser lock files
+    // 4. Remove stale browser lock files
     this._removeBrowserLockSync(tid);
 
     console.log(`🛑 [Tenant ${tid}] Client destroyed (RAM cleared)`);
-  }
-
-  _killOrphanedBrowsers(tenantId) {
-    const tid = String(tenantId);
-    try {
-      // Find and kill chromium processes using this tenant's session dir
-      // Works on Linux/Docker — gracefully ignored on Windows
-      execSync(`pkill -9 -f "session-tenant_${tid}" 2>/dev/null || true`, { timeout: 5000 });
-    } catch (_) {}
-    try {
-      // Also try to kill any chromium that uses the wwebjs_auth dir for this tenant
-      execSync(`pkill -9 -f "tenant_${tid}" 2>/dev/null || true`, { timeout: 5000 });
-    } catch (_) {}
   }
 
   _removeBrowserLockSync(tenantId) {
@@ -1833,10 +1826,13 @@ app.get('/', (req, res) => {
 });
 
 app.get('/login', (req, res) => {
-  // If user explicitly visits /login, clear their session and show login page
-  // This prevents the redirect loop when marketer is stuck on "contact admin" screen
+  // Only redirect admins back to admin panel; never redirect tenants (they might be stuck on overlay)
   const decoded = verifyToken(req);
-  if (decoded) {
+  if (decoded && decoded.role === 'admin') {
+    return res.redirect('/admin');
+  }
+  // Clear tenant cookie so they can re-login
+  if (decoded && decoded.role === 'tenant') {
     res.clearCookie('crm_token');
   }
   res.sendFile(path.join(__dirname, 'public', 'login.html'));

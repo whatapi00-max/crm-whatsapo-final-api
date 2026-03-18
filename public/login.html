@@ -118,10 +118,10 @@
   <script>
     // Check if already logged in
     fetch('/api/auth/check').then(r => r.json()).then(data => {
-      if (data.authenticated) {
-        if (data.role === 'admin') window.location.href = '/admin';
-        else window.location.href = '/crm';
+      if (data.authenticated && data.role === 'admin') {
+        window.location.href = '/admin';
       }
+      // Don't redirect tenants — they may be here to re-login
     }).catch(() => {});
 
     function switchTab(tab) {
