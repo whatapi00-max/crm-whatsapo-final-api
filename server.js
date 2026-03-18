@@ -18,6 +18,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const { execSync } = require('child_process');
 
 // ── Config ──────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -128,8 +129,9 @@ class TenantWAManager {
       await this.destroyClient(tenantId);
     }
 
-    // Remove stale browser lock files before starting
-    await this._removeBrowserLock(tid);
+    // Kill any orphaned chromium processes and remove lock files
+    this._killOrphanedBrowsers(tid);
+    this._removeBrowserLockSync(tid);
 
     const client = new Client({
       authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth', clientId: `tenant_${tid}` }),
@@ -221,6 +223,11 @@ class TenantWAManager {
 
     console.log(`⏳ [Tenant ${tid}] Initializing WhatsApp client...`);
 
+    // Track retry count to avoid infinite loops
+    if (!this._retryCounts) this._retryCounts = new Map();
+    const retryCount = this._retryCounts.get(tid) || 0;
+    const MAX_RETRIES = 3;
+
     // Initialize with timeout so it doesn't hang forever
     const INIT_TIMEOUT_MS = 120000;
     await Promise.race([
@@ -228,18 +235,26 @@ class TenantWAManager {
       new Promise((_, reject) =>
         setTimeout(() => reject(new Error('Client init timed out')), INIT_TIMEOUT_MS)
       )
-    ]).catch(async (err) => {
-      console.error(`❌ [Tenant ${tid}] Init error: ${err.message}`);
+    ]).then(() => {
+      // Success — reset retry counter
+      this._retryCounts.delete(tid);
+    }).catch(async (err) => {
+      console.error(`❌ [Tenant ${tid}] Init error (attempt ${retryCount + 1}/${MAX_RETRIES}): ${err.message}`);
       state.initializing = false;
 
-      // Fully destroy the failed client and its browser before retrying
+      // Fully destroy the failed client and its browser
       await this.destroyClient(tenantId);
 
-      if (!state.qrCode && !state.ready) {
-        console.log(`🔄 [Tenant ${tid}] Will retry init in 20s...`);
+      if (retryCount < MAX_RETRIES && !state.qrCode && !state.ready) {
+        this._retryCounts.set(tid, retryCount + 1);
+        const delayMs = 15000 + (retryCount * 10000); // 15s, 25s, 35s
+        console.log(`🔄 [Tenant ${tid}] Will retry init in ${delayMs / 1000}s...`);
         setTimeout(() => {
           this.initClient(tenantId).catch(() => {});
-        }, 20000);
+        }, delayMs);
+      } else if (retryCount >= MAX_RETRIES) {
+        console.error(`🚫 [Tenant ${tid}] Max retries reached. Use admin panel to reconnect manually.`);
+        this._retryCounts.delete(tid);
       }
     });
 
@@ -454,50 +469,76 @@ class TenantWAManager {
     const tid = String(tenantId);
     const state = this.clients.get(tid);
     if (!state) {
-      // Even without state, clean up lock files from orphaned processes
-      await this._removeBrowserLock(tid);
+      this._killOrphanedBrowsers(tid);
+      this._removeBrowserLockSync(tid);
       return;
     }
     if (state.scheduledInterval) clearInterval(state.scheduledInterval);
 
-    // 1. Try graceful destroy
-    try { await state.client.destroy(); } catch (e) {}
+    // 1. Try graceful destroy (with timeout — don't let it hang)
+    try {
+      await Promise.race([
+        state.client.destroy(),
+        new Promise(r => setTimeout(r, 8000))
+      ]);
+    } catch (e) {
+      console.log(`⚠️  [Tenant ${tid}] Graceful destroy failed: ${e.message}`);
+    }
 
-    // 2. Force-kill the underlying browser process if still alive
+    // 2. Force-kill the underlying browser process via puppeteer handle
     try {
       const browser = state.client?.pupBrowser;
       if (browser) {
         const proc = browser.process();
-        if (proc) {
+        if (proc && !proc.killed) {
           proc.kill('SIGKILL');
-          // Wait a moment for the process to actually die
-          await new Promise(r => setTimeout(r, 1000));
         }
-        await browser.close().catch(() => {});
       }
     } catch (_) {}
 
     this.clients.delete(tid);
 
-    // 3. Remove stale browser lock files
-    await this._removeBrowserLock(tid);
+    // 3. Kill any orphaned chromium processes for this tenant
+    this._killOrphanedBrowsers(tid);
+
+    // 4. Wait for processes to fully die
+    await new Promise(r => setTimeout(r, 2000));
+
+    // 5. Remove stale browser lock files
+    this._removeBrowserLockSync(tid);
 
     console.log(`🛑 [Tenant ${tid}] Client destroyed (RAM cleared)`);
   }
 
-  async _removeBrowserLock(tenantId) {
+  _killOrphanedBrowsers(tenantId) {
     const tid = String(tenantId);
-    const sessionDir = path.join(__dirname, '.wwebjs_auth', `session-tenant_${tid}`);
+    try {
+      // Find and kill chromium processes using this tenant's session dir
+      // Works on Linux/Docker — gracefully ignored on Windows
+      execSync(`pkill -9 -f "session-tenant_${tid}" 2>/dev/null || true`, { timeout: 5000 });
+    } catch (_) {}
+    try {
+      // Also try to kill any chromium that uses the wwebjs_auth dir for this tenant
+      execSync(`pkill -9 -f "tenant_${tid}" 2>/dev/null || true`, { timeout: 5000 });
+    } catch (_) {}
+  }
+
+  _removeBrowserLockSync(tenantId) {
+    const tid = String(tenantId);
+    // Check both the symlink path and the real data path (Docker: /app/.wwebjs_auth -> /data/.wwebjs_auth)
+    const sessionPaths = [
+      path.join(__dirname, '.wwebjs_auth', `session-tenant_${tid}`),
+      path.resolve('/data/.wwebjs_auth', `session-tenant_${tid}`)
+    ];
     const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
-    for (const lockFile of lockFiles) {
-      const lockPath = path.join(sessionDir, lockFile);
-      try { await fs.promises.unlink(lockPath); } catch (_) {}
-    }
-    // Also check inside Default profile dir
-    const defaultDir = path.join(sessionDir, 'Default');
-    for (const lockFile of lockFiles) {
-      const lockPath = path.join(defaultDir, lockFile);
-      try { await fs.promises.unlink(lockPath); } catch (_) {}
+    for (const sessionDir of sessionPaths) {
+      for (const lockFile of lockFiles) {
+        try { fs.unlinkSync(path.join(sessionDir, lockFile)); } catch (_) {}
+      }
+      // Also check inside Default profile dir
+      for (const lockFile of lockFiles) {
+        try { fs.unlinkSync(path.join(sessionDir, 'Default', lockFile)); } catch (_) {}
+      }
     }
   }
 
