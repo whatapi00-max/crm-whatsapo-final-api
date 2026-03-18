@@ -105,10 +105,31 @@ class TenantWAManager {
 
   async initClient(tenantId) {
     const tid = String(tenantId);
+
+    // Prevent concurrent init for the same tenant
+    if (this._initLocks && this._initLocks.has(tid)) {
+      console.log(`⚠️  [Tenant ${tid}] Init already in progress, skipping`);
+      return this.getState(tid);
+    }
+    if (!this._initLocks) this._initLocks = new Set();
+    this._initLocks.add(tid);
+
+    try {
+      return await this._doInitClient(tenantId);
+    } finally {
+      this._initLocks.delete(tid);
+    }
+  }
+
+  async _doInitClient(tenantId) {
+    const tid = String(tenantId);
     if (this.clients.has(tid) && this.clients.get(tid).client) {
       console.log(`⚠️  Client for tenant ${tid} already exists, destroying first...`);
       await this.destroyClient(tenantId);
     }
+
+    // Remove stale browser lock files before starting
+    await this._removeBrowserLock(tid);
 
     const client = new Client({
       authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth', clientId: `tenant_${tid}` }),
@@ -207,18 +228,17 @@ class TenantWAManager {
       new Promise((_, reject) =>
         setTimeout(() => reject(new Error('Client init timed out')), INIT_TIMEOUT_MS)
       )
-    ]).catch(err => {
+    ]).catch(async (err) => {
       console.error(`❌ [Tenant ${tid}] Init error: ${err.message}`);
       state.initializing = false;
-      // Don't destroy — QR may still arrive via event
+
+      // Fully destroy the failed client and its browser before retrying
+      await this.destroyClient(tenantId);
+
       if (!state.qrCode && !state.ready) {
         console.log(`🔄 [Tenant ${tid}] Will retry init in 20s...`);
         setTimeout(() => {
-          if (!state.ready && !state.qrCode) {
-            this.destroyClient(tenantId)
-              .then(() => this.initClient(tenantId))
-              .catch(() => {});
-          }
+          this.initClient(tenantId).catch(() => {});
         }, 20000);
       }
     });
@@ -433,16 +453,52 @@ class TenantWAManager {
   async destroyClient(tenantId) {
     const tid = String(tenantId);
     const state = this.clients.get(tid);
-    if (!state) return;
+    if (!state) {
+      // Even without state, clean up lock files from orphaned processes
+      await this._removeBrowserLock(tid);
+      return;
+    }
     if (state.scheduledInterval) clearInterval(state.scheduledInterval);
+
+    // 1. Try graceful destroy
     try { await state.client.destroy(); } catch (e) {}
-    // Force-kill the underlying browser process if still alive
+
+    // 2. Force-kill the underlying browser process if still alive
     try {
       const browser = state.client?.pupBrowser;
-      if (browser) await browser.close().catch(() => {});
+      if (browser) {
+        const proc = browser.process();
+        if (proc) {
+          proc.kill('SIGKILL');
+          // Wait a moment for the process to actually die
+          await new Promise(r => setTimeout(r, 1000));
+        }
+        await browser.close().catch(() => {});
+      }
     } catch (_) {}
+
     this.clients.delete(tid);
+
+    // 3. Remove stale browser lock files
+    await this._removeBrowserLock(tid);
+
     console.log(`🛑 [Tenant ${tid}] Client destroyed (RAM cleared)`);
+  }
+
+  async _removeBrowserLock(tenantId) {
+    const tid = String(tenantId);
+    const sessionDir = path.join(__dirname, '.wwebjs_auth', `session-tenant_${tid}`);
+    const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
+    for (const lockFile of lockFiles) {
+      const lockPath = path.join(sessionDir, lockFile);
+      try { await fs.promises.unlink(lockPath); } catch (_) {}
+    }
+    // Also check inside Default profile dir
+    const defaultDir = path.join(sessionDir, 'Default');
+    for (const lockFile of lockFiles) {
+      const lockPath = path.join(defaultDir, lockFile);
+      try { await fs.promises.unlink(lockPath); } catch (_) {}
+    }
   }
 
   async cleanupSessionFiles(tenantId) {
