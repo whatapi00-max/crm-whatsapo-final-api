@@ -172,6 +172,7 @@ function getWABadge(status) {
   switch (status) {
     case 'connected': return '<span class="badge badge-connected"><span class="dot dot-green"></span> Connected</span>';
     case 'waiting_qr': return '<span class="badge badge-qr"><span class="dot dot-yellow"></span> QR Ready</span>';
+    case 'initializing': return '<span class="badge badge-qr"><span class="dot dot-yellow"></span> Starting...</span>';
     case 'disconnected': return '<span class="badge badge-disconnected"><span class="dot dot-red"></span> Disconnected</span>';
     case 'banned': return '<span class="badge badge-disconnected">Banned</span>';
     default: return '<span class="badge badge-init">Not Init</span>';
@@ -432,12 +433,12 @@ async function disconnectWA(id) {
 
 function openQrModal(id, name) {
   document.getElementById('qr-title').textContent = `Connect WhatsApp - ${name}`;
-  document.getElementById('qr-container').innerHTML = '<div class="dark:text-gray-500 text-gray-400 text-sm py-8">Generating QR code...</div>';
+  document.getElementById('qr-container').innerHTML = '<div class="dark:text-gray-500 text-gray-400 text-sm py-8"><div class="inline-block w-6 h-6 border-2 border-current border-t-transparent rounded-full animate-spin mb-2"></div><br>Starting WhatsApp engine...<br><span class="text-xs opacity-60">This may take 30–60 seconds on first connect</span></div>';
   document.getElementById('modal-qr').classList.remove('hidden');
 
   qrPollTenantId = id;
   pollQR();
-  qrPollInterval = setInterval(pollQR, 3000);
+  qrPollInterval = setInterval(pollQR, 2000);
 }
 
 async function pollQR() {
@@ -462,6 +463,8 @@ async function pollQR() {
     } else if (data.image) {
       container.innerHTML = `<img src="${data.image}" alt="QR Code" class="mx-auto rounded-xl" style="width:260px;height:260px;">
         <p class="text-[11px] dark:text-gray-500 text-gray-400 mt-3">Open WhatsApp &gt; Linked Devices &gt; Link a Device</p>`;
+    } else if (data.status === 'initializing') {
+      container.innerHTML = '<div class="dark:text-gray-500 text-gray-400 text-sm py-8"><div class="inline-block w-6 h-6 border-2 border-current border-t-transparent rounded-full animate-spin mb-2"></div><br>Starting WhatsApp engine...<br><span class="text-xs opacity-60">Launching browser, please wait...</span></div>';
     } else {
       container.innerHTML = '<div class="dark:text-gray-500 text-gray-400 text-sm py-8">Waiting for QR code...</div>';
     }

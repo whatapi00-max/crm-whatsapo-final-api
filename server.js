@@ -71,7 +71,7 @@ function isDuplicate(tenantId, msgId) {
 // ══════════════════════════════════════════════
 class TenantWAManager {
   constructor() {
-    this.clients = new Map(); // tenantId -> { client, ready, qrCode, manualStatus, scheduledInterval }
+    this.clients = new Map(); // tenantId -> { client, ready, qrCode, manualStatus, scheduledInterval, initializing }
   }
 
   getState(tenantId) {
@@ -99,6 +99,7 @@ class TenantWAManager {
     if (s.manualStatus === 'banned') return 'banned';
     if (s.ready) return 'connected';
     if (s.qrCode) return 'waiting_qr';
+    if (s.initializing) return 'initializing';
     return 'disconnected';
   }
 
@@ -111,10 +112,7 @@ class TenantWAManager {
 
     const client = new Client({
       authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth', clientId: `tenant_${tid}` }),
-      webVersionCache: {
-        type: 'remote',
-        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1023231413-alpha.html'
-      },
+      webVersionCache: { type: 'none' },
       puppeteer: {
         headless: true,
         executablePath: CHROME_PATH,
@@ -124,16 +122,21 @@ class TenantWAManager {
           '--disable-extensions', '--disable-background-networking', '--disable-default-apps',
           '--disable-sync', '--disable-translate', '--hide-scrollbars',
           '--metrics-recording-only', '--mute-audio', '--no-default-browser-check',
-          '--safebrowsing-disable-auto-update'
-        ]
+          '--safebrowsing-disable-auto-update',
+          '--single-process', '--no-zygote',
+          '--disable-software-rasterizer', '--disable-features=site-per-process',
+          '--js-flags=--max-old-space-size=256'
+        ],
+        timeout: 90000
       }
     });
 
-    const state = { client, ready: false, qrCode: null, manualStatus: null, scheduledInterval: null };
+    const state = { client, ready: false, qrCode: null, manualStatus: null, scheduledInterval: null, initializing: true };
     this.clients.set(tid, state);
 
     client.on('qr', (qr) => {
       state.qrCode = qr;
+      state.initializing = false;
       console.log(`📱 [Tenant ${tid}] QR code generated`);
       qrcode.generate(qr, { small: true });
     });
@@ -141,18 +144,21 @@ class TenantWAManager {
     client.on('ready', () => {
       state.ready = true;
       state.qrCode = null;
+      state.initializing = false;
       console.log(`✅ [Tenant ${tid}] WhatsApp client READY`);
       this.startScheduledChecker(tenantId);
       this.bulkResolveRealPhones(tenantId).catch(e => console.error(`⚠️  [Tenant ${tid}] Bulk resolve error:`, e.message));
     });
 
     client.on('authenticated', () => {
+      state.initializing = false;
       console.log(`🔐 [Tenant ${tid}] WhatsApp authenticated`);
     });
 
     client.on('auth_failure', (msg) => {
       console.error(`❌ [Tenant ${tid}] Auth failure:`, msg);
       state.ready = false;
+      state.initializing = false;
       const msgStr = String(msg || '').toUpperCase();
       if (msgStr.includes('401') || msgStr.includes('CONFLICT') || msgStr.includes('BANNED')) {
         state.manualStatus = 'banned';
@@ -163,12 +169,17 @@ class TenantWAManager {
       console.log(`⚠️  [Tenant ${tid}] Disconnected:`, reason);
       state.ready = false;
       state.qrCode = null;
+      state.initializing = false;
       const reasonStr = String(reason || '').toUpperCase();
       if (reasonStr.includes('CONFLICT') || reasonStr.includes('BANNED') || reasonStr === '401') {
         state.manualStatus = 'banned';
       } else if (reason !== 'LOGOUT') {
-        console.log(`🔄 [Tenant ${tid}] Reconnecting in 10s...`);
-        setTimeout(() => client.initialize().catch(() => {}), 10000);
+        console.log(`🔄 [Tenant ${tid}] Reconnecting in 15s (full re-init)...`);
+        setTimeout(() => {
+          this.destroyClient(tenantId)
+            .then(() => this.initClient(tenantId))
+            .catch(e => console.error(`❌ [Tenant ${tid}] Reconnect failed:`, e.message));
+        }, 15000);
       }
     });
 
@@ -176,7 +187,30 @@ class TenantWAManager {
     this.setupMessageHandlers(tenantId, client);
 
     console.log(`⏳ [Tenant ${tid}] Initializing WhatsApp client...`);
-    await client.initialize();
+
+    // Initialize with timeout so it doesn't hang forever
+    const INIT_TIMEOUT_MS = 120000;
+    await Promise.race([
+      client.initialize(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Client init timed out')), INIT_TIMEOUT_MS)
+      )
+    ]).catch(err => {
+      console.error(`❌ [Tenant ${tid}] Init error: ${err.message}`);
+      state.initializing = false;
+      // Don't destroy — QR may still arrive via event
+      if (!state.qrCode && !state.ready) {
+        console.log(`🔄 [Tenant ${tid}] Will retry init in 20s...`);
+        setTimeout(() => {
+          if (!state.ready && !state.qrCode) {
+            this.destroyClient(tenantId)
+              .then(() => this.initClient(tenantId))
+              .catch(() => {});
+          }
+        }, 20000);
+      }
+    });
+
     return state;
   }
 
@@ -390,6 +424,11 @@ class TenantWAManager {
     if (!state) return;
     if (state.scheduledInterval) clearInterval(state.scheduledInterval);
     try { await state.client.destroy(); } catch (e) {}
+    // Force-kill the underlying browser process if still alive
+    try {
+      const browser = state.client?.pupBrowser;
+      if (browser) await browser.close().catch(() => {});
+    } catch (_) {}
     this.clients.delete(tid);
     console.log(`🛑 [Tenant ${tid}] Client destroyed (RAM cleared)`);
   }
@@ -737,6 +776,11 @@ app.post('/api/admin/tenants/:id/connect-wa', adminAuth, async (req, res) => {
     const existing = waManager.getState(id);
     if (existing && existing.ready) {
       return res.json({ success: true, status: 'already_connected' });
+    }
+
+    // If there's a stale/stuck client, destroy it first
+    if (existing && !existing.ready) {
+      await waManager.destroyClient(id);
     }
 
     waManager.initClient(id).catch(err => {
