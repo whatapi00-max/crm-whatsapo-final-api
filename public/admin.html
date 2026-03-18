@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Billy777 WhatsApp CRM - Super Admin</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: { 50: '#f0fdf4', 100: '#dcfce7', 500: '#22c55e', 600: '#16a34a', 700: '#15803d' },
+            dark: { 950: '#080810', 900: '#0c0c18', 850: '#10102a', 800: '#161630', 750: '#1a1a3a', 700: '#1e1e44' },
+            wa: { green: '#25D366', dark: '#075E54', teal: '#128C7E' }
+          }
+        }
+      }
+    };
+    if (localStorage.getItem('admin-theme') === 'dark' || (!localStorage.getItem('admin-theme') && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+      document.documentElement.classList.add('dark');
+    }
+  </script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Inter', sans-serif; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    .dark ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 99px; }
+    ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.12); border-radius: 99px; }
+    .card { border-radius: 16px; transition: all 0.2s; }
+    .dark .card { background: rgba(16,16,42,0.6); border: 1px solid rgba(255,255,255,0.06); backdrop-filter: blur(12px); }
+    .card { background: white; border: 1px solid rgba(0,0,0,0.06); box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+    .stat-card { border-radius: 16px; padding: 20px 24px; position: relative; overflow: hidden; }
+    .dark .stat-card { background: linear-gradient(135deg, rgba(16,16,42,0.8), rgba(26,26,58,0.5)); border: 1px solid rgba(255,255,255,0.06); }
+    .stat-card { background: white; border: 1px solid rgba(0,0,0,0.06); box-shadow: 0 1px 4px rgba(0,0,0,0.04); }
+    .stat-card .stat-icon { position: absolute; top: -8px; right: -8px; width: 64px; height: 64px; border-radius: 50%; opacity: 0.08; }
+    .btn-primary {
+      padding: 9px 22px; border-radius: 12px; font-size: 13px; font-weight: 600;
+      background: linear-gradient(135deg, #25D366, #128C7E); color: white; border: none;
+      cursor: pointer; transition: all 0.2s; display: inline-flex; align-items: center; gap: 6px;
+    }
+    .btn-primary:hover { box-shadow: 0 6px 24px rgba(37,211,102,0.35); transform: translateY(-1px); }
+    .btn-primary:active { transform: translateY(0); }
+    .btn-secondary {
+      padding: 9px 22px; border-radius: 12px; font-size: 13px; font-weight: 600;
+      border: none; cursor: pointer; transition: all 0.2s; display: inline-flex; align-items: center; gap: 6px;
+    }
+    .dark .btn-secondary { background: rgba(255,255,255,0.06); color: #d1d5db; }
+    .btn-secondary { background: #f3f4f6; color: #374151; }
+    .btn-secondary:hover { opacity: 0.85; }
+    .btn-sm {
+      padding: 5px 14px; border-radius: 10px; font-size: 11px; font-weight: 600;
+      cursor: pointer; transition: all 0.15s; border: none; display: inline-flex; align-items: center; gap: 4px;
+    }
+    .btn-connect { background: rgba(37,211,102,0.12); color: #25D366; }
+    .btn-connect:hover { background: rgba(37,211,102,0.22); }
+    .btn-disconnect { background: rgba(239,68,68,0.1); color: #f87171; }
+    .btn-disconnect:hover { background: rgba(239,68,68,0.2); }
+    .btn-edit { background: rgba(59,130,246,0.1); color: #60a5fa; }
+    .btn-edit:hover { background: rgba(59,130,246,0.2); }
+    .btn-delete { background: rgba(239,68,68,0.06); color: #f87171; }
+    .btn-delete:hover { background: rgba(239,68,68,0.16); }
+    .btn-copy { background: rgba(168,85,247,0.1); color: #c084fc; }
+    .btn-copy:hover { background: rgba(168,85,247,0.2); }
+    .badge {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 3px 10px; border-radius: 99px; font-size: 10px; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.5px;
+    }
+    .badge-connected { background: rgba(37,211,102,0.12); color: #22c55e; }
+    .badge-disconnected { background: rgba(239,68,68,0.1); color: #ef4444; }
+    .badge-qr { background: rgba(251,191,36,0.12); color: #f59e0b; }
+    .badge-init { background: rgba(99,102,241,0.12); color: #818cf8; }
+    .badge-active { background: rgba(34,197,94,0.1); color: #22c55e; }
+    .badge-inactive { background: rgba(107,114,128,0.12); color: #9ca3af; }
+    .dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+    .dot-green { background: #22c55e; box-shadow: 0 0 8px rgba(34,197,94,0.5); }
+    .dot-red { background: #ef4444; }
+    .dot-yellow { background: #f59e0b; animation: pulse-dot 1.5s infinite; }
+    @keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+    .field-input {
+      padding: 10px 14px; border-radius: 12px; font-size: 13px;
+      outline: none; transition: all 0.2s; width: 100%;
+    }
+    .dark .field-input { background: rgba(12,12,24,0.7); border: 1px solid rgba(255,255,255,0.08); color: #e5e7eb; }
+    .field-input { background: #f9fafb; border: 1px solid #e5e7eb; color: #111827; }
+    .dark .field-input:focus { border-color: rgba(37,211,102,0.5); box-shadow: 0 0 0 3px rgba(37,211,102,0.08); }
+    .field-input:focus { border-color: #25D366; box-shadow: 0 0 0 3px rgba(37,211,102,0.12); }
+    .dark .field-input::placeholder { color: #4b5563; }
+    .field-input::placeholder { color: #9ca3af; }
+    .modal-bg {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      z-index: 100; backdrop-filter: blur(6px);
+    }
+    .dark .modal-bg { background: rgba(0,0,0,0.6); }
+    .modal-bg { background: rgba(0,0,0,0.3); }
+    .modal-box {
+      border-radius: 20px; padding: 28px; width: 100%; max-width: 520px;
+      box-shadow: 0 25px 60px rgba(0,0,0,0.3); max-height: 90vh; overflow-y: auto;
+    }
+    .dark .modal-box { background: #0f0f22; border: 1px solid rgba(255,255,255,0.08); }
+    .modal-box { background: white; border: 1px solid rgba(0,0,0,0.08); }
+    .modal-bg.hidden { display: none; }
+    .tenant-row { transition: all 0.12s; }
+    .dark .tenant-row:hover { background: rgba(255,255,255,0.02); }
+    .tenant-row:hover { background: rgba(0,0,0,0.015); }
+    .creds-box { border-radius: 14px; padding: 16px; margin-top: 12px; }
+    .dark .creds-box { background: rgba(37,211,102,0.05); border: 1px solid rgba(37,211,102,0.12); }
+    .creds-box { background: #f0fdf4; border: 1px solid #bbf7d0; }
+    .creds-row { display: flex; justify-content: space-between; align-items: center; padding: 5px 0; font-size: 13px; }
+    .dark .creds-label { color: #6b7280; }
+    .creds-label { color: #6b7280; }
+    .dark .creds-value { color: #e5e7eb; font-weight: 600; }
+    .creds-value { color: #111827; font-weight: 600; }
+    .toast-wrap {
+      position: fixed; bottom: 24px; right: 24px; z-index: 300;
+      display: flex; flex-direction: column; gap: 8px; align-items: flex-end;
+    }
+    .toast-item {
+      padding: 12px 20px; border-radius: 14px; font-size: 13px; font-weight: 500;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.2); transition: all 0.3s;
+      transform: translateX(120%); opacity: 0; display: flex; align-items: center; gap: 8px;
+    }
+    .toast-item.show { transform: translateX(0); opacity: 1; }
+    .dark .toast-success { background: rgba(34,197,94,0.15); border: 1px solid rgba(34,197,94,0.25); color: #22c55e; }
+    .toast-success { background: #f0fdf4; border: 1px solid #bbf7d0; color: #16a34a; }
+    .dark .toast-error { background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.25); color: #ef4444; }
+    .toast-error { background: #fef2f2; border: 1px solid #fecaca; color: #dc2626; }
+    .dark .toast-info { background: rgba(59,130,246,0.15); border: 1px solid rgba(59,130,246,0.25); color: #3b82f6; }
+    .toast-info { background: #eff6ff; border: 1px solid #bfdbfe; color: #2563eb; }
+    .search-wrap { position: relative; }
+    .search-wrap svg { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); pointer-events: none; }
+    .search-wrap input { padding-left: 36px; }
+    .progress-bar { height: 6px; border-radius: 99px; overflow: hidden; }
+    .dark .progress-bar { background: rgba(255,255,255,0.06); }
+    .progress-bar { background: #e5e7eb; }
+    .progress-fill { height: 100%; border-radius: 99px; background: linear-gradient(90deg, #25D366, #128C7E); transition: width 0.3s; }
+    .progress-fill-warn { background: linear-gradient(90deg, #f59e0b, #ef4444) !important; }
+    .progress-fill-danger { background: linear-gradient(90deg, #ef4444, #dc2626) !important; }
+    .avatar-grad-0 { background: linear-gradient(135deg, #25D366, #128C7E); }
+    .avatar-grad-1 { background: linear-gradient(135deg, #3B82F6, #6366F1); }
+    .avatar-grad-2 { background: linear-gradient(135deg, #F59E0B, #EF4444); }
+    .avatar-grad-3 { background: linear-gradient(135deg, #EC4899, #8B5CF6); }
+    .avatar-grad-4 { background: linear-gradient(135deg, #06B6D4, #3B82F6); }
+    .avatar-grad-5 { background: linear-gradient(135deg, #10B981, #059669); }
+    @media (max-width: 768px) {
+      .hide-mobile { display: none !important; }
+      .stat-card { padding: 14px 16px; }
+    }
+  </style>
+</head>
+<body class="min-h-screen transition-colors duration-200">
+  <div class="dark:bg-dark-950 bg-gray-50 dark:text-gray-100 text-gray-800 min-h-screen">
+
+  <!-- Header -->
+  <header class="sticky top-0 z-50 border-b transition-colors duration-200 dark:border-white/5 border-gray-200/80 dark:bg-dark-900/85 bg-white/85 backdrop-blur-xl">
+    <div class="max-w-[1400px] mx-auto px-4 sm:px-6 py-3 flex items-center justify-between gap-4">
+      <div class="flex items-center gap-3 flex-shrink-0">
+        <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-wa-green to-wa-teal flex items-center justify-center shadow-lg shadow-wa-green/20">
+          <svg class="w-5 h-5 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+        </div>
+        <div>
+          <h1 class="text-sm font-extrabold dark:text-white text-gray-900">Billy777 <span class="font-normal text-xs dark:text-gray-500 text-gray-400">Super Admin</span></h1>
+          <p class="text-[10px] dark:text-gray-600 text-gray-400">WhatsApp CRM &bull; Multi-Tenant</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        <button onclick="toggleTheme()" class="p-2 rounded-xl dark:hover:bg-white/5 hover:bg-gray-100 transition" title="Toggle theme">
+          <svg id="icon-sun" class="w-5 h-5 dark:text-gray-400 text-gray-500 hidden dark:block" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><path stroke-linecap="round" d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+          <svg id="icon-moon" class="w-5 h-5 dark:text-gray-400 text-gray-500 block dark:hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/></svg>
+        </button>
+        <div class="h-5 w-px dark:bg-white/10 bg-gray-200 mx-1 hide-mobile"></div>
+        <span class="text-xs dark:text-gray-500 text-gray-400 hide-mobile">Logged in as <span class="dark:text-white text-gray-800 font-semibold" id="admin-name">Admin</span></span>
+        <button onclick="logout()" class="text-xs dark:text-gray-400 text-gray-500 hover:text-red-500 transition px-3 py-1.5 rounded-lg dark:hover:bg-red-500/10 hover:bg-red-50">Logout</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Content -->
+  <main class="max-w-[1400px] mx-auto px-4 sm:px-6 py-6 space-y-6">
+    <!-- Stats Row -->
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+      <div class="stat-card">
+        <div class="stat-icon bg-green-500"></div>
+        <p class="text-[10px] font-bold uppercase tracking-widest dark:text-gray-500 text-gray-400 mb-1">Total Marketers</p>
+        <p class="text-2xl font-extrabold dark:text-white text-gray-900" id="stat-tenants">0</p>
+        <p class="text-[10px] dark:text-gray-600 text-gray-400 mt-1" id="stat-active-info">0 active</p>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon bg-emerald-400"></div>
+        <p class="text-[10px] font-bold uppercase tracking-widest dark:text-gray-500 text-gray-400 mb-1">WA Connected</p>
+        <p class="text-2xl font-extrabold text-green-500" id="stat-connected">0</p>
+        <p class="text-[10px] dark:text-gray-600 text-gray-400 mt-1" id="stat-disconnected-info">0 disconnected</p>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon bg-blue-500"></div>
+        <p class="text-[10px] font-bold uppercase tracking-widest dark:text-gray-500 text-gray-400 mb-1">Total Leads</p>
+        <p class="text-2xl font-extrabold text-blue-500" id="stat-leads">0</p>
+        <p class="text-[10px] dark:text-gray-600 text-gray-400 mt-1">Across all marketers</p>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon bg-purple-500"></div>
+        <p class="text-[10px] font-bold uppercase tracking-widest dark:text-gray-500 text-gray-400 mb-1">Messages Today</p>
+        <p class="text-2xl font-extrabold text-purple-500" id="stat-msgs">0</p>
+        <p class="text-[10px] dark:text-gray-600 text-gray-400 mt-1">All tenants combined</p>
+      </div>
+    </div>
+
+    <!-- Storage Alerts -->
+    <div id="storage-alerts" class="space-y-2"></div>
+
+    <!-- Storage Dashboard -->
+    <div class="card p-5" id="storage-section">
+      <div class="flex items-center justify-between mb-5">
+        <div class="flex items-center gap-3">
+          <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-purple-500 to-indigo-600 flex items-center justify-center shadow-lg shadow-purple-500/20">
+            <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"/></svg>
+          </div>
+          <div>
+            <h2 class="text-sm font-bold dark:text-white text-gray-900">System Storage</h2>
+            <p class="text-[10px] dark:text-gray-500 text-gray-400">Real-time server resource monitoring</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <button class="btn-sm btn-edit" onclick="loadStorageStats()" title="Refresh">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      <!-- Resource Gauges -->
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+        <!-- RAM -->
+        <div class="p-4 rounded-xl dark:bg-dark-900/50 bg-gray-50 border dark:border-white/5 border-gray-100">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-2">
+              <div class="w-7 h-7 rounded-lg bg-blue-500/15 flex items-center justify-center">
+                <svg class="w-3.5 h-3.5 text-blue-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"/></svg>
+              </div>
+              <span class="text-xs font-bold dark:text-gray-300 text-gray-700">RAM</span>
+            </div>
+            <span class="text-[10px] font-mono font-bold dark:text-gray-400 text-gray-500" id="ram-percent">0%</span>
+          </div>
+          <div class="progress-bar mb-2"><div class="progress-fill" id="ram-bar" style="width:0%"></div></div>
+          <div class="flex justify-between text-[10px] dark:text-gray-500 text-gray-400">
+            <span id="ram-used">0 MB</span>
+            <span id="ram-limit">/ 512 MB</span>
+          </div>
+          <p class="text-[10px] dark:text-gray-600 text-gray-400 mt-1" id="ram-clients">0 active WA clients</p>
+        </div>
+
+        <!-- Disk -->
+        <div class="p-4 rounded-xl dark:bg-dark-900/50 bg-gray-50 border dark:border-white/5 border-gray-100">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-2">
+              <div class="w-7 h-7 rounded-lg bg-green-500/15 flex items-center justify-center">
+                <svg class="w-3.5 h-3.5 text-green-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4"/></svg>
+              </div>
+              <span class="text-xs font-bold dark:text-gray-300 text-gray-700">Disk (Sessions)</span>
+            </div>
+            <span class="text-[10px] font-mono font-bold dark:text-gray-400 text-gray-500" id="disk-percent">0%</span>
+          </div>
+          <div class="progress-bar mb-2"><div class="progress-fill" id="disk-bar" style="width:0%"></div></div>
+          <div class="flex justify-between text-[10px] dark:text-gray-500 text-gray-400">
+            <span id="disk-used">0 MB</span>
+            <span id="disk-limit">/ 1024 MB</span>
+          </div>
+          <div class="mt-2 flex gap-1.5">
+            <button class="btn-sm btn-edit text-[9px] px-2 py-0.5" onclick="cleanupOrphans()">Clean Orphans</button>
+          </div>
+        </div>
+
+        <!-- Database -->
+        <div class="p-4 rounded-xl dark:bg-dark-900/50 bg-gray-50 border dark:border-white/5 border-gray-100">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-2">
+              <div class="w-7 h-7 rounded-lg bg-purple-500/15 flex items-center justify-center">
+                <svg class="w-3.5 h-3.5 text-purple-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"/></svg>
+              </div>
+              <span class="text-xs font-bold dark:text-gray-300 text-gray-700">Database</span>
+            </div>
+            <span class="text-[10px] font-mono font-bold dark:text-gray-400 text-gray-500" id="db-percent">0%</span>
+          </div>
+          <div class="progress-bar mb-2"><div class="progress-fill" id="db-bar" style="width:0%"></div></div>
+          <div class="flex justify-between text-[10px] dark:text-gray-500 text-gray-400">
+            <span id="db-used">~0 MB</span>
+            <span id="db-limit">/ 500 MB</span>
+          </div>
+          <p class="text-[10px] dark:text-gray-600 text-gray-400 mt-1" id="db-rows">0 total rows</p>
+          <div class="mt-2 flex gap-1.5">
+            <button class="btn-sm btn-disconnect text-[9px] px-2 py-0.5" onclick="openCleanupModal()">Purge Old Messages</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- DB Row Breakdown -->
+      <div class="mb-5">
+        <h4 class="text-[10px] font-bold uppercase tracking-widest dark:text-gray-500 text-gray-400 mb-3">Database Breakdown</h4>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2" id="db-breakdown">
+          <div class="text-center p-2.5 rounded-lg dark:bg-dark-900/40 bg-gray-50/80">
+            <p class="text-lg font-extrabold dark:text-white text-gray-900" id="db-conv">0</p>
+            <p class="text-[9px] dark:text-gray-500 text-gray-400">Messages</p>
+          </div>
+          <div class="text-center p-2.5 rounded-lg dark:bg-dark-900/40 bg-gray-50/80">
+            <p class="text-lg font-extrabold dark:text-white text-gray-900" id="db-leads">0</p>
+            <p class="text-[9px] dark:text-gray-500 text-gray-400">Leads</p>
+          </div>
+          <div class="text-center p-2.5 rounded-lg dark:bg-dark-900/40 bg-gray-50/80">
+            <p class="text-lg font-extrabold dark:text-white text-gray-900" id="db-broadcasts">0</p>
+            <p class="text-[9px] dark:text-gray-500 text-gray-400">Broadcasts</p>
+          </div>
+          <div class="text-center p-2.5 rounded-lg dark:bg-dark-900/40 bg-gray-50/80">
+            <p class="text-lg font-extrabold dark:text-white text-gray-900" id="db-other">0</p>
+            <p class="text-[9px] dark:text-gray-500 text-gray-400">Other Records</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Per-Tenant Storage -->
+      <div>
+        <h4 class="text-[10px] font-bold uppercase tracking-widest dark:text-gray-500 text-gray-400 mb-3">Storage per Marketer</h4>
+        <div class="overflow-x-auto">
+          <table class="w-full text-left">
+            <thead>
+              <tr class="dark:border-white/5 border-gray-100 border-b text-[9px] uppercase tracking-widest dark:text-gray-600 text-gray-400 font-bold">
+                <th class="px-3 py-2">Marketer</th>
+                <th class="px-3 py-2">WA Status</th>
+                <th class="px-3 py-2">RAM</th>
+                <th class="px-3 py-2">Disk</th>
+                <th class="px-3 py-2">DB Rows</th>
+                <th class="px-3 py-2">Est. DB Size</th>
+              </tr>
+            </thead>
+            <tbody id="storage-tenants-body">
+              <tr><td colspan="6" class="px-3 py-6 text-center text-xs dark:text-gray-600 text-gray-400">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Server Info -->
+      <div class="mt-5 pt-4 border-t dark:border-white/5 border-gray-100 flex flex-wrap items-center gap-3">
+        <span class="text-[10px] dark:text-gray-600 text-gray-400">Uptime: <span class="font-mono font-bold dark:text-gray-400 text-gray-500" id="server-uptime">-</span></span>
+        <span class="text-[10px] dark:text-gray-600 text-gray-400">Heap: <span class="font-mono font-bold dark:text-gray-400 text-gray-500" id="server-heap">-</span></span>
+      </div>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+      <div class="flex items-center gap-3">
+        <h2 class="text-lg font-bold dark:text-white text-gray-900">Marketers</h2>
+        <span class="text-xs dark:text-gray-600 text-gray-400 font-mono" id="tenant-count-badge">0 total</span>
+      </div>
+      <div class="flex items-center gap-2 flex-wrap">
+        <div class="search-wrap">
+          <svg class="w-4 h-4 dark:text-gray-600 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+          <input type="text" id="search-input" class="field-input w-48 sm:w-56 text-xs" placeholder="Search marketers..." oninput="filterTenants()">
+        </div>
+        <button class="btn-secondary" onclick="openBulkModal()">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4-4v2M9 7a4 4 0 100-8 4 4 0 000 8zM23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
+          Bulk Add
+        </button>
+        <button class="btn-primary" onclick="openCreateModal()">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+          Add Marketer
+        </button>
+      </div>
+    </div>
+
+    <!-- Tenants Table -->
+    <div class="card overflow-hidden">
+      <div class="overflow-x-auto">
+        <table class="w-full text-left" id="tenants-table">
+          <thead>
+            <tr class="dark:border-white/5 border-gray-100 border-b text-[10px] uppercase tracking-widest dark:text-gray-500 text-gray-400 font-bold">
+              <th class="px-5 py-3.5">Marketer</th>
+              <th class="px-5 py-3.5">Username</th>
+              <th class="px-5 py-3.5 hide-mobile">Unique Key</th>
+              <th class="px-5 py-3.5">Status</th>
+              <th class="px-5 py-3.5">WhatsApp</th>
+              <th class="px-5 py-3.5 hide-mobile">Stats</th>
+              <th class="px-5 py-3.5 text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="tenants-body">
+            <tr><td colspan="7" class="px-5 py-16 text-center">
+              <div class="flex flex-col items-center gap-3">
+                <div class="w-12 h-12 rounded-2xl dark:bg-white/5 bg-gray-100 flex items-center justify-center">
+                  <svg class="w-6 h-6 dark:text-gray-600 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z"/></svg>
+                </div>
+                <p class="dark:text-gray-500 text-gray-400 text-sm">Loading marketers...</p>
+              </div>
+            </td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+
+  <!-- Create / Edit Modal -->
+  <div class="modal-bg hidden" id="modal-tenant" onclick="if(event.target===this)closeModal('modal-tenant')">
+    <div class="modal-box">
+      <h3 class="text-lg font-bold dark:text-white text-gray-900 mb-1" id="modal-title">Add Marketer</h3>
+      <p class="text-xs dark:text-gray-500 text-gray-400 mb-5" id="modal-subtitle">Create a new marketer account</p>
+      <form id="tenant-form" class="space-y-4" onsubmit="saveTenant(event)">
+        <input type="hidden" id="tf-id" value="">
+        <div>
+          <label class="block text-[10px] font-bold uppercase tracking-wider dark:text-gray-500 text-gray-400 mb-1.5">Name</label>
+          <input type="text" id="tf-name" class="field-input" placeholder="Marketer full name" required>
+        </div>
+        <div>
+          <label class="block text-[10px] font-bold uppercase tracking-wider dark:text-gray-500 text-gray-400 mb-1.5">Username</label>
+          <input type="text" id="tf-username" class="field-input" placeholder="login_username (letters, numbers, _)" required>
+        </div>
+        <div>
+          <label class="block text-[10px] font-bold uppercase tracking-wider dark:text-gray-500 text-gray-400 mb-1.5">Password</label>
+          <input type="password" id="tf-password" class="field-input" placeholder="Minimum 6 characters" required>
+        </div>
+        <div id="modal-error" class="text-red-500 text-xs text-center hidden"></div>
+        <div class="flex gap-2 pt-2">
+          <button type="button" class="flex-1 py-2.5 rounded-xl text-sm font-medium dark:bg-white/5 bg-gray-100 dark:text-gray-400 text-gray-500 hover:opacity-80 transition" onclick="closeModal('modal-tenant')">Cancel</button>
+          <button type="submit" class="flex-1 btn-primary py-2.5 justify-center" id="tf-submit">Create</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Bulk Add Modal -->
+  <div class="modal-bg hidden" id="modal-bulk" onclick="if(event.target===this)closeModal('modal-bulk')">
+    <div class="modal-box" style="max-width:600px;">
+      <h3 class="text-lg font-bold dark:text-white text-gray-900 mb-1">Bulk Add Marketers</h3>
+      <p class="text-xs dark:text-gray-500 text-gray-400 mb-5">Create up to 30 marketers at once. One per line: <code class="dark:text-gray-300 text-gray-600 font-mono text-[11px]">name, username, password</code></p>
+      <div>
+        <textarea id="bulk-input" class="field-input font-mono text-xs" rows="10" placeholder="John Doe, johndoe, pass123456
+Jane Smith, janesmith, securepass
+Mike Wilson, mikew, mypass999
+..." style="resize:vertical;min-height:180px;"></textarea>
+        <p class="text-[10px] dark:text-gray-600 text-gray-400 mt-1.5">Format: <strong>Name, Username, Password</strong> (min 6 chars). Max 30 at a time.</p>
+      </div>
+      <div id="bulk-error" class="text-red-500 text-xs text-center mt-2 hidden"></div>
+      <div id="bulk-progress" class="hidden mt-4">
+        <div class="flex items-center justify-between text-xs mb-2">
+          <span class="dark:text-gray-400 text-gray-500" id="bulk-progress-text">Creating marketers...</span>
+          <span class="font-mono font-bold dark:text-white text-gray-900" id="bulk-progress-count">0/0</span>
+        </div>
+        <div class="progress-bar"><div class="progress-fill" id="bulk-progress-fill" style="width:0%"></div></div>
+      </div>
+      <div id="bulk-results" class="hidden mt-4 max-h-48 overflow-y-auto space-y-1"></div>
+      <div class="flex gap-2 pt-4">
+        <button type="button" class="flex-1 py-2.5 rounded-xl text-sm font-medium dark:bg-white/5 bg-gray-100 dark:text-gray-400 text-gray-500 hover:opacity-80 transition" onclick="closeModal('modal-bulk')" id="bulk-cancel-btn">Cancel</button>
+        <button type="button" class="flex-1 btn-primary py-2.5 justify-center" id="bulk-submit-btn" onclick="startBulkAdd()">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+          Create All
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Credentials Modal -->
+  <div class="modal-bg hidden" id="modal-creds" onclick="if(event.target===this)closeModal('modal-creds')">
+    <div class="modal-box">
+      <div class="flex items-center gap-3 mb-4">
+        <div class="w-10 h-10 rounded-xl bg-green-500/15 flex items-center justify-center">
+          <svg class="w-5 h-5 text-green-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        </div>
+        <div>
+          <h3 class="text-base font-bold dark:text-white text-gray-900">Marketer Created!</h3>
+          <p class="text-[11px] dark:text-gray-500 text-gray-400">Share these credentials securely</p>
+        </div>
+      </div>
+      <div class="creds-box" id="creds-content"></div>
+      <div class="flex gap-2 pt-4">
+        <button onclick="copyCreds()" class="flex-1 btn-primary py-2.5 justify-center">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10"/></svg>
+          Copy All
+        </button>
+        <button onclick="closeModal('modal-creds')" class="flex-1 py-2.5 rounded-xl text-sm font-medium dark:bg-white/5 bg-gray-100 dark:text-gray-400 text-gray-500 hover:opacity-80 transition">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bulk Creds Modal -->
+  <div class="modal-bg hidden" id="modal-bulk-creds" onclick="if(event.target===this)closeModal('modal-bulk-creds')">
+    <div class="modal-box" style="max-width:640px;">
+      <div class="flex items-center gap-3 mb-4">
+        <div class="w-10 h-10 rounded-xl bg-green-500/15 flex items-center justify-center">
+          <svg class="w-5 h-5 text-green-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        </div>
+        <div>
+          <h3 class="text-base font-bold dark:text-white text-gray-900">Bulk Creation Complete!</h3>
+          <p class="text-[11px] dark:text-gray-500 text-gray-400" id="bulk-creds-subtitle">All marketers created successfully</p>
+        </div>
+      </div>
+      <div id="bulk-creds-content" class="max-h-72 overflow-y-auto space-y-2"></div>
+      <div class="flex gap-2 pt-4">
+        <button onclick="copyBulkCreds()" class="flex-1 btn-primary py-2.5 justify-center">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10"/></svg>
+          Copy All Credentials
+        </button>
+        <button onclick="closeModal('modal-bulk-creds')" class="flex-1 py-2.5 rounded-xl text-sm font-medium dark:bg-white/5 bg-gray-100 dark:text-gray-400 text-gray-500 hover:opacity-80 transition">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- QR Modal -->
+  <div class="modal-bg hidden" id="modal-qr" onclick="if(event.target===this)closeQrModal()">
+    <div class="modal-box text-center">
+      <h3 class="text-lg font-bold dark:text-white text-gray-900 mb-1" id="qr-title">Connect WhatsApp</h3>
+      <p class="text-xs dark:text-gray-500 text-gray-400 mb-5" id="qr-subtitle">Scan this QR code with WhatsApp</p>
+      <div id="qr-container" class="py-4">
+        <div class="dark:text-gray-500 text-gray-400 text-sm py-8">Initializing...</div>
+      </div>
+      <button onclick="closeQrModal()" class="mt-2 w-full py-2.5 rounded-xl text-sm font-medium dark:bg-white/5 bg-gray-100 dark:text-gray-400 text-gray-500 hover:opacity-80 transition">Close</button>
+    </div>
+  </div>
+
+  <!-- Delete Modal -->
+  <div class="modal-bg hidden" id="modal-delete" onclick="if(event.target===this)closeModal('modal-delete')">
+    <div class="modal-box">
+      <div class="flex items-center gap-3 mb-4">
+        <div class="w-10 h-10 rounded-xl bg-red-500/15 flex items-center justify-center">
+          <svg class="w-5 h-5 text-red-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+        </div>
+        <div>
+          <h3 class="text-base font-bold text-red-500">Delete Marketer</h3>
+          <p class="text-[11px] dark:text-gray-500 text-gray-400">This action cannot be undone</p>
+        </div>
+      </div>
+      <p class="text-sm dark:text-gray-400 text-gray-500 mb-5" id="delete-msg">Are you sure? All data will be permanently deleted.</p>
+      <div class="flex gap-2">
+        <button onclick="closeModal('modal-delete')" class="flex-1 py-2.5 rounded-xl text-sm font-medium dark:bg-white/5 bg-gray-100 dark:text-gray-400 text-gray-500 hover:opacity-80 transition">Cancel</button>
+        <button onclick="confirmDelete()" class="flex-1 py-2.5 rounded-xl text-sm font-bold bg-red-500/15 text-red-500 hover:bg-red-500/25 transition" id="delete-confirm-btn">Delete Forever</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Purge Old Messages Modal -->
+  <div class="modal-bg hidden" id="modal-cleanup" onclick="if(event.target===this)closeModal('modal-cleanup')">
+    <div class="modal-box">
+      <div class="flex items-center gap-3 mb-4">
+        <div class="w-10 h-10 rounded-xl bg-amber-500/15 flex items-center justify-center">
+          <svg class="w-5 h-5 text-amber-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+        </div>
+        <div>
+          <h3 class="text-base font-bold dark:text-white text-gray-900">Purge Old Messages</h3>
+          <p class="text-[11px] dark:text-gray-500 text-gray-400">Free up database storage</p>
+        </div>
+      </div>
+      <p class="text-sm dark:text-gray-400 text-gray-500 mb-4">Delete conversation messages older than a specified number of days. This frees database space. Leads and other data are NOT affected.</p>
+      <div class="mb-4">
+        <label class="block text-[10px] font-bold uppercase tracking-wider dark:text-gray-500 text-gray-400 mb-1.5">Delete messages older than (days)</label>
+        <input type="number" id="cleanup-days" class="field-input" value="90" min="7" max="365" placeholder="90">
+      </div>
+      <div class="flex gap-2">
+        <button onclick="closeModal('modal-cleanup')" class="flex-1 py-2.5 rounded-xl text-sm font-medium dark:bg-white/5 bg-gray-100 dark:text-gray-400 text-gray-500 hover:opacity-80 transition">Cancel</button>
+        <button onclick="confirmCleanup()" class="flex-1 py-2.5 rounded-xl text-sm font-bold bg-amber-500/15 text-amber-500 hover:bg-amber-500/25 transition" id="cleanup-confirm-btn">Purge Messages</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toasts -->
+  <div class="toast-wrap" id="toast-container"></div>
+
+  </div>
+  <script src="admin.js"></script>
+</body>
+</html>

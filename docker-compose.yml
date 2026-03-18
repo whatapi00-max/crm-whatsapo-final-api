@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  whatsapp-crm:
+    build: .
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - PORT=3000
+      - MESSAGE_DELAY_MS=${MESSAGE_DELAY_MS:-2500}
+      - NODE_ENV=production
+    volumes:
+      - wwebjs_auth:/app/.wwebjs_auth
+    restart: unless-stopped
+
+volumes:
+  wwebjs_auth:

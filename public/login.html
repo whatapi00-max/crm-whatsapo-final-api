@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Billy777 WhatsApp CRM - Login</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            dark: { 950: '#0a0a14', 900: '#0f0f1a', 850: '#13132a', 800: '#1a1a2e', 700: '#16213e' },
+            wa: { green: '#25D366', dark: '#075E54', teal: '#128C7E' }
+          }
+        }
+      }
+    }
+  </script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: 'Inter', sans-serif; }
+    .login-card { background: rgba(15,15,26,0.95); border: 1px solid rgba(255,255,255,0.06); }
+    .field-input {
+      padding: 10px 14px; border-radius: 10px; font-size: 14px;
+      background: rgba(15,15,26,0.6); border: 1px solid rgba(255,255,255,0.08);
+      color: #e5e7eb; outline: none; transition: border-color 0.2s; width: 100%;
+    }
+    .field-input:focus { border-color: rgba(37,211,102,0.5); }
+    .field-input::placeholder { color: #4b5563; }
+    .btn-login {
+      width: 100%; padding: 12px; border-radius: 12px; font-size: 14px; font-weight: 600;
+      background: linear-gradient(135deg, #25D366, #128C7E); color: white; border: none;
+      cursor: pointer; transition: all 0.2s;
+    }
+    .btn-login:hover { box-shadow: 0 4px 20px rgba(37,211,102,0.3); transform: translateY(-1px); }
+    .btn-login:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
+    .tab-btn {
+      flex: 1; padding: 10px; text-align: center; font-size: 13px; font-weight: 500;
+      border-radius: 10px; cursor: pointer; transition: all 0.2s; color: #6b7280;
+      background: transparent; border: none;
+    }
+    .tab-btn.active { background: rgba(37,211,102,0.15); color: #25D366; }
+    .error-msg { color: #f87171; font-size: 12px; text-align: center; margin-top: 8px; }
+    .particle { position: absolute; border-radius: 50%; pointer-events: none; animation: float 15s infinite; opacity: 0.04; }
+    @keyframes float {
+      0%, 100% { transform: translateY(0) translateX(0); }
+      25% { transform: translateY(-30px) translateX(20px); }
+      50% { transform: translateY(-10px) translateX(-15px); }
+      75% { transform: translateY(-40px) translateX(10px); }
+    }
+  </style>
+</head>
+<body class="bg-dark-950 text-gray-100 min-h-screen flex items-center justify-center relative overflow-hidden">
+
+  <!-- Background particles -->
+  <div class="particle bg-wa-green" style="width:300px;height:300px;top:-50px;left:-50px;"></div>
+  <div class="particle bg-blue-500" style="width:200px;height:200px;bottom:-30px;right:-30px;animation-delay:5s;"></div>
+  <div class="particle bg-purple-500" style="width:150px;height:150px;top:40%;left:60%;animation-delay:10s;"></div>
+
+  <div class="login-card rounded-2xl p-8 w-full max-w-md relative z-10 shadow-2xl">
+    <!-- Logo -->
+    <div class="text-center mb-8">
+      <div class="w-16 h-16 rounded-2xl bg-gradient-to-br from-wa-green to-wa-teal flex items-center justify-center mx-auto mb-4 shadow-lg shadow-wa-green/20">
+        <svg class="w-9 h-9 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+      </div>
+      <h1 class="text-2xl font-bold bg-gradient-to-r from-wa-green to-blue-400 bg-clip-text text-transparent">Billy777 WhatsApp CRM</h1>
+      <p class="text-xs text-gray-500 mt-1">Multi-Tenant Business Platform</p>
+    </div>
+
+    <!-- Tabs -->
+    <div class="flex gap-2 mb-6 p-1 rounded-xl bg-dark-800">
+      <button class="tab-btn active" id="tab-marketer" onclick="switchTab('marketer')">Marketer Login</button>
+      <button class="tab-btn" id="tab-admin" onclick="switchTab('admin')">Admin Login</button>
+    </div>
+
+    <!-- Marketer Login Form -->
+    <form id="form-marketer" class="space-y-4" onsubmit="loginMarketer(event)">
+      <div>
+        <label class="block text-[11px] font-semibold uppercase tracking-wider text-gray-500 mb-1.5">Username / ID</label>
+        <input type="text" id="m-username" class="field-input" placeholder="Enter your username" autocomplete="username" required>
+      </div>
+      <div>
+        <label class="block text-[11px] font-semibold uppercase tracking-wider text-gray-500 mb-1.5">Password</label>
+        <input type="password" id="m-password" class="field-input" placeholder="Enter your password" autocomplete="current-password" required>
+      </div>
+      <div>
+        <label class="block text-[11px] font-semibold uppercase tracking-wider text-gray-500 mb-1.5">Unique Key</label>
+        <input type="text" id="m-key" class="field-input" placeholder="Enter your unique key" required>
+      </div>
+      <button type="submit" class="btn-login" id="m-submit">
+        <span id="m-btn-text">Sign In</span>
+      </button>
+      <div id="m-error" class="error-msg hidden"></div>
+    </form>
+
+    <!-- Admin Login Form -->
+    <form id="form-admin" class="space-y-4 hidden" onsubmit="loginAdmin(event)">
+      <div>
+        <label class="block text-[11px] font-semibold uppercase tracking-wider text-gray-500 mb-1.5">Admin Username</label>
+        <input type="text" id="a-username" class="field-input" placeholder="Enter admin username" autocomplete="username" required>
+      </div>
+      <div>
+        <label class="block text-[11px] font-semibold uppercase tracking-wider text-gray-500 mb-1.5">Admin Password</label>
+        <input type="password" id="a-password" class="field-input" placeholder="Enter admin password" autocomplete="current-password" required>
+      </div>
+      <button type="submit" class="btn-login" id="a-submit">
+        <span id="a-btn-text">Sign In as Admin</span>
+      </button>
+      <div id="a-error" class="error-msg hidden"></div>
+    </form>
+
+    <p class="text-center text-[10px] text-gray-600 mt-6">Billy777 WhatsApp CRM v3.0 &bull; Multi-Tenant</p>
+  </div>
+
+  <script>
+    // Check if already logged in
+    fetch('/api/auth/check').then(r => r.json()).then(data => {
+      if (data.authenticated) {
+        if (data.role === 'admin') window.location.href = '/admin';
+        else window.location.href = '/crm';
+      }
+    }).catch(() => {});
+
+    function switchTab(tab) {
+      document.getElementById('tab-marketer').classList.toggle('active', tab === 'marketer');
+      document.getElementById('tab-admin').classList.toggle('active', tab === 'admin');
+      document.getElementById('form-marketer').classList.toggle('hidden', tab !== 'marketer');
+      document.getElementById('form-admin').classList.toggle('hidden', tab !== 'admin');
+      document.getElementById('m-error').classList.add('hidden');
+      document.getElementById('a-error').classList.add('hidden');
+    }
+
+    async function loginMarketer(e) {
+      e.preventDefault();
+      const btn = document.getElementById('m-submit');
+      const errEl = document.getElementById('m-error');
+      btn.disabled = true;
+      document.getElementById('m-btn-text').textContent = 'Signing in...';
+      errEl.classList.add('hidden');
+
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('m-username').value.trim(),
+            password: document.getElementById('m-password').value,
+            unique_key: document.getElementById('m-key').value.trim()
+          })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Login failed');
+        window.location.href = '/crm';
+      } catch (err) {
+        errEl.textContent = err.message;
+        errEl.classList.remove('hidden');
+      } finally {
+        btn.disabled = false;
+        document.getElementById('m-btn-text').textContent = 'Sign In';
+      }
+    }
+
+    async function loginAdmin(e) {
+      e.preventDefault();
+      const btn = document.getElementById('a-submit');
+      const errEl = document.getElementById('a-error');
+      btn.disabled = true;
+      document.getElementById('a-btn-text').textContent = 'Signing in...';
+      errEl.classList.add('hidden');
+
+      try {
+        const res = await fetch('/api/auth/admin-login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('a-username').value.trim(),
+            password: document.getElementById('a-password').value
+          })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Login failed');
+        window.location.href = '/admin';
+      } catch (err) {
+        errEl.textContent = err.message;
+        errEl.classList.remove('hidden');
+      } finally {
+        btn.disabled = false;
+        document.getElementById('a-btn-text').textContent = 'Sign In as Admin';
+      }
+    }
+  </script>
+</body>
+</html>

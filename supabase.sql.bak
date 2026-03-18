@@ -1,0 +1,188 @@
+-- ============================================
+-- WhatsApp CRM Pro - Supabase Database Schema
+-- ============================================
+-- Run this in: Supabase Dashboard → SQL Editor → New Query
+
+-- Drop existing view first (must happen before any potential failures)
+DROP VIEW IF EXISTS dashboard_stats CASCADE;
+
+-- ── MIGRATION: Add new columns to existing tables ──────────────────────────
+-- If you already have the database set up from a previous version, run these
+-- ALTER statements first to add the new columns without losing existing data.
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS email VARCHAR(150);
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS company VARCHAR(150);
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS assigned_to VARCHAR(100);
+ALTER TABLE quick_replies ADD COLUMN IF NOT EXISTS shortcut VARCHAR(30);
+-- Deduplicate quick_replies keeping only the lowest id per title
+DELETE FROM quick_replies a USING quick_replies b WHERE a.id > b.id AND a.title = b.title;
+-- ───────────────────────────────────────────────────────────────────────────
+
+-- 1. Conversations table (all messages)
+CREATE TABLE IF NOT EXISTS conversations (
+  id BIGSERIAL PRIMARY KEY,
+  phone VARCHAR(20) NOT NULL,
+  message TEXT NOT NULL,
+  direction VARCHAR(10) NOT NULL CHECK (direction IN ('incoming', 'outgoing')),
+  status VARCHAR(20) DEFAULT 'delivered',
+  media_url TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 2. Leads table (contact management)
+CREATE TABLE IF NOT EXISTS leads (
+  id BIGSERIAL PRIMARY KEY,
+  phone VARCHAR(20) UNIQUE NOT NULL,
+  wa_jid VARCHAR(60),
+  real_phone VARCHAR(30),
+  name VARCHAR(100) DEFAULT 'Unknown',
+  email VARCHAR(150),
+  company VARCHAR(150),
+  source VARCHAR(50) DEFAULT 'organic',
+  status VARCHAR(30) DEFAULT 'new' CHECK (status IN ('new', 'contacted', 'interested', 'negotiation', 'sold', 'lost')),
+  assigned_to VARCHAR(100),
+  revenue DECIMAL(12,2) DEFAULT 0,
+  tags TEXT[] DEFAULT '{}',
+  notes TEXT,
+  last_message_at TIMESTAMPTZ DEFAULT NOW(),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 3. Quick replies table
+CREATE TABLE IF NOT EXISTS quick_replies (
+  id BIGSERIAL PRIMARY KEY,
+  title VARCHAR(100) NOT NULL,
+  message TEXT NOT NULL,
+  category VARCHAR(50) DEFAULT 'general',
+  shortcut VARCHAR(30),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 4. Message templates (like wati.io approved templates)
+CREATE TABLE IF NOT EXISTS message_templates (
+  id BIGSERIAL PRIMARY KEY,
+  name VARCHAR(100) NOT NULL,
+  category VARCHAR(50) DEFAULT 'marketing',
+  body TEXT NOT NULL,
+  variables TEXT[] DEFAULT '{}',
+  status VARCHAR(20) DEFAULT 'active',
+  usage_count INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 5. Broadcast campaigns
+CREATE TABLE IF NOT EXISTS broadcasts (
+  id BIGSERIAL PRIMARY KEY,
+  name VARCHAR(150) NOT NULL,
+  template_id BIGINT REFERENCES message_templates(id),
+  message TEXT NOT NULL,
+  target_filter JSONB DEFAULT '{}',
+  target_count INTEGER DEFAULT 0,
+  sent_count INTEGER DEFAULT 0,
+  failed_count INTEGER DEFAULT 0,
+  status VARCHAR(20) DEFAULT 'draft' CHECK (status IN ('draft', 'scheduled', 'sending', 'completed', 'cancelled')),
+  scheduled_at TIMESTAMPTZ,
+  started_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 6. Broadcast recipients
+CREATE TABLE IF NOT EXISTS broadcast_recipients (
+  id BIGSERIAL PRIMARY KEY,
+  broadcast_id BIGINT REFERENCES broadcasts(id) ON DELETE CASCADE,
+  phone VARCHAR(20) NOT NULL,
+  status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed', 'delivered')),
+  error_message TEXT,
+  sent_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 7. Auto-reply rules (chatbot)
+CREATE TABLE IF NOT EXISTS auto_replies (
+  id BIGSERIAL PRIMARY KEY,
+  name VARCHAR(100) NOT NULL,
+  trigger_type VARCHAR(20) DEFAULT 'keyword' CHECK (trigger_type IN ('keyword', 'contains', 'regex', 'first_message')),
+  trigger_value VARCHAR(500) NOT NULL,
+  reply_message TEXT NOT NULL,
+  is_active BOOLEAN DEFAULT true,
+  priority INTEGER DEFAULT 0,
+  usage_count INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 8. Scheduled messages
+CREATE TABLE IF NOT EXISTS scheduled_messages (
+  id BIGSERIAL PRIMARY KEY,
+  phone VARCHAR(20) NOT NULL,
+  message TEXT NOT NULL,
+  scheduled_at TIMESTAMPTZ NOT NULL,
+  status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed', 'cancelled')),
+  sent_at TIMESTAMPTZ,
+  error_message TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 9. Contact notes / activity log
+CREATE TABLE IF NOT EXISTS activity_log (
+  id BIGSERIAL PRIMARY KEY,
+  phone VARCHAR(20) NOT NULL,
+  action VARCHAR(50) NOT NULL,
+  details TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 10. Indexes for fast queries
+CREATE INDEX IF NOT EXISTS idx_conversations_phone ON conversations(phone);
+CREATE INDEX IF NOT EXISTS idx_conversations_created ON conversations(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conversations_direction ON conversations(direction);
+CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status);
+CREATE INDEX IF NOT EXISTS idx_leads_phone ON leads(phone);
+CREATE INDEX IF NOT EXISTS idx_leads_source ON leads(source);
+CREATE INDEX IF NOT EXISTS idx_leads_assigned ON leads(assigned_to);
+CREATE INDEX IF NOT EXISTS idx_broadcasts_status ON broadcasts(status);
+CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_broadcast ON broadcast_recipients(broadcast_id);
+CREATE INDEX IF NOT EXISTS idx_scheduled_messages_status ON scheduled_messages(status);
+CREATE INDEX IF NOT EXISTS idx_auto_replies_active ON auto_replies(is_active);
+CREATE INDEX IF NOT EXISTS idx_activity_log_phone ON activity_log(phone);
+
+-- 11. Insert default quick replies
+INSERT INTO quick_replies (title, message, category, shortcut) VALUES
+  ('Welcome', 'Hi! Welcome to our service. How can I help you today? 😊', 'greeting', '/welcome'),
+  ('Thanks', 'Thank you for reaching out! We''ll get back to you shortly.', 'greeting', '/thanks'),
+  ('Price List', 'Here are our current prices:\n\n📋 Basic: $99\n📋 Pro: $199\n📋 Enterprise: $499\n\nWhich plan interests you?', 'sales', '/price'),
+  ('Follow Up', 'Hi! Just following up on our previous conversation. Do you have any questions?', 'follow-up', '/followup'),
+  ('Closing', 'Great choice! Let me set that up for you right away. 🎉', 'sales', '/close'),
+  ('Away', 'Thanks for your message! We''re currently away but will respond within 24 hours.', 'support', '/away'),
+  ('Hours', 'Our business hours are:\n🕐 Mon-Fri: 9AM - 6PM\n🕐 Sat: 10AM - 2PM\n🕐 Sun: Closed', 'support', '/hours')
+ON CONFLICT DO NOTHING;
+
+-- 12. Insert default message templates
+INSERT INTO message_templates (name, category, body, variables) VALUES
+  ('Welcome Message', 'greeting', 'Hello {{name}}! Welcome to our service. We''re excited to have you with us. How can we help you today?', '{name}'),
+  ('Order Confirmation', 'transactional', 'Hi {{name}}, your order #{{order_id}} has been confirmed! We''ll notify you when it ships. Thank you for your purchase! 🎉', '{name,order_id}'),
+  ('Follow Up', 'marketing', 'Hi {{name}}, just checking in! We noticed you were interested in our {{product}}. Would you like more information or ready to proceed?', '{name,product}'),
+  ('Appointment Reminder', 'utility', 'Hi {{name}}, this is a reminder about your appointment on {{date}} at {{time}}. Reply YES to confirm or RESCHEDULE to change.', '{name,date,time}'),
+  ('Feedback Request', 'marketing', 'Hi {{name}}! We hope you''re enjoying our service. Could you take a moment to share your feedback? Your opinion matters to us! ⭐', '{name}')
+ON CONFLICT DO NOTHING;
+
+-- 13. Insert default auto-replies
+INSERT INTO auto_replies (name, trigger_type, trigger_value, reply_message, priority) VALUES
+  ('First Contact Welcome', 'first_message', '*', 'Hi there! 👋 Thanks for reaching out. How can we help you today?', 100),
+  ('Price Inquiry', 'contains', 'price,pricing,cost,how much', 'Thanks for your interest in our pricing! Here are our plans:\n\n📋 Basic: $99/mo\n📋 Pro: $199/mo\n📋 Enterprise: Contact us\n\nWould you like more details on any plan?', 50),
+  ('Hours Inquiry', 'contains', 'hours,open,available,when', 'Our business hours are:\n🕐 Mon-Fri: 9AM - 6PM\n🕐 Sat: 10AM - 2PM\n🕐 Sun: Closed\n\nWe''ll respond to messages outside hours within 24h!', 40)
+ON CONFLICT DO NOTHING;
+
+-- 14. View for dashboard stats
+CREATE VIEW dashboard_stats AS
+SELECT
+  (SELECT COUNT(*) FROM leads) AS total_leads,
+  (SELECT COUNT(*) FROM leads WHERE status = 'new') AS new_leads,
+  (SELECT COUNT(*) FROM leads WHERE status = 'sold') AS sold_leads,
+  (SELECT COUNT(*) FROM leads WHERE status = 'interested') AS interested_leads,
+  (SELECT COUNT(*) FROM leads WHERE status = 'contacted') AS contacted_leads,
+  (SELECT COALESCE(SUM(revenue), 0) FROM leads) AS total_revenue,
+  (SELECT COUNT(*) FROM conversations WHERE created_at > NOW() - INTERVAL '24 hours') AS messages_today,
+  (SELECT COUNT(*) FROM conversations WHERE direction = 'incoming' AND created_at > NOW() - INTERVAL '24 hours') AS incoming_today,
+  (SELECT COUNT(*) FROM conversations WHERE direction = 'outgoing' AND created_at > NOW() - INTERVAL '24 hours') AS outgoing_today,
+  (SELECT COUNT(*) FROM broadcasts WHERE status = 'completed') AS total_broadcasts,
+  (SELECT COUNT(*) FROM scheduled_messages WHERE status = 'pending') AS pending_scheduled;

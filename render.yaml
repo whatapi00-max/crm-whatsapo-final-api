@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: whatsapp-crm-pro
+    runtime: docker
+    region: oregon
+    plan: starter
+    healthCheckPath: /login
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: NODE_ENV
+        value: production
+      - key: MESSAGE_DELAY_MS
+        value: "2500"
+      - key: RATE_LIMIT_WINDOW_MS
+        value: "60000"
+      - key: RATE_LIMIT_MAX
+        value: "30"
+    disk:
+      name: wwebjs-data
+      mountPath: /data
+      sizeGB: 1
