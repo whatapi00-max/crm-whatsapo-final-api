@@ -508,9 +508,10 @@ async function selectChat(phone) {
     const initials = getInitials(lead.name || lead.phone);
     $('#chat-avatar').textContent = initials;
     $('#chat-avatar').style.background = getAvatarColor(phone);
-    $('#chat-name').textContent = lead.name || (lead.real_phone ? '+' + lead.real_phone : '+' + lead.phone);
-    $('#chat-phone').textContent = lead.real_phone ? '+' + lead.real_phone : '+' + phone;
-    if (lead.real_phone && lead.real_phone !== phone) {
+    const displayReal = lead.real_phone || lead.phone;
+    $('#chat-name').textContent = lead.name || ('+' + displayReal);
+    $('#chat-phone').textContent = '+' + displayReal;
+    if (displayReal !== phone) {
       $('#chat-phone').textContent += ' (WA ID: ' + phone + ')';
     }
     $('#chat-status-select').value = lead.status || 'new';
@@ -520,7 +521,10 @@ async function selectChat(phone) {
     $('#info-avatar').style.background = getAvatarColor(phone);
     $('#info-name').value = lead.name || '';
     $('#info-phone').textContent = 'WA ID: ' + phone;
-    $('#info-real-phone').value = lead.real_phone || '';
+    const phoneVal = lead.real_phone || lead.phone || '';
+    $('#info-real-phone').value = phoneVal ? (phoneVal.startsWith('+') ? phoneVal : '+' + phoneVal) : '';
+    // Auto-resolve if real_phone not yet set
+    if (!lead.real_phone) setTimeout(() => resolvePhone(), 1000);
     $('#info-email').value = lead.email || '';
     $('#info-company').value = lead.company || '';
     $('#info-source').value = lead.source || 'organic';
@@ -702,9 +706,10 @@ async function resolvePhone() {
   try {
     const result = await apiPost(`/api/leads/${encodeURIComponent(currentPhone)}/resolve`, {});
     if (result.success && result.real_phone) {
-      $('#info-real-phone').value = result.real_phone;
-      $('#chat-phone').textContent = result.real_phone;
-      showToast(`Phone detected: ${result.real_phone}`, 'success');
+      const rp = result.real_phone.startsWith('+') ? result.real_phone : '+' + result.real_phone;
+      $('#info-real-phone').value = rp;
+      $('#chat-phone').textContent = rp;
+      showToast(`Phone: ${rp}`, 'success');
       loadActiveChats();
     } else {
       showToast(result.message || 'Could not detect phone', 'info');
@@ -767,7 +772,7 @@ async function loadContactsPage() {
             <span class="font-medium text-sm">${escapeHtml(c.name || 'Unknown')}</span>
           </div>
         </td>
-        <td class="px-4 py-3 text-xs text-gray-400">${escapeHtml(c.real_phone || '+' + c.phone)}</td>
+        <td class="px-4 py-3 text-xs text-gray-400">${escapeHtml(c.real_phone ? '+' + c.real_phone : '+' + c.phone)}</td>
         <td class="px-4 py-3"><span class="status-badge status-${escapeAttr(c.status)}">${escapeHtml(c.status)}</span></td>
         <td class="px-4 py-3 text-xs text-gray-500">${escapeHtml(c.source || 'organic')}</td>
         <td class="px-4 py-3 text-xs text-gray-500">${(c.tags || []).map(t => `<span class="inline-block px-1.5 py-0.5 rounded bg-gray-100 dark:bg-white/5 text-gray-600 dark:text-gray-400 mr-1">${escapeHtml(t)}</span>`).join('')}</td>

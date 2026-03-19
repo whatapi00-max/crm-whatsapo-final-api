@@ -177,16 +177,6 @@ class TenantWAManager {
       // Skip bulkResolveRealPhones to save memory on 512MB instances
     });
 
-    client.on('authenticated', () => {
-      state.initializing = false;
-      console.log(`🔐 [Tenant ${tid}] WhatsApp authenticated`);
-      // Capture browser PID for safe cleanup later
-      try {
-        const proc = client.pupBrowser?.process();
-        if (proc) state.browserPid = proc.pid;
-      } catch (_) {}
-    });
-
     client.on('auth_failure', (msg) => {
       console.error(`❌ [Tenant ${tid}] Auth failure:`, msg);
       state.ready = false;
@@ -195,18 +185,47 @@ class TenantWAManager {
       if (msgStr.includes('401') || msgStr.includes('CONFLICT') || msgStr.includes('BANNED')) {
         state.manualStatus = 'banned';
       } else {
-        // Session likely corrupted (e.g. sudden power loss) — clean up and retry
-        console.log(`🔄 [Tenant ${tid}] Auth failure (possibly corrupted session), cleaning up and retrying in 10s...`);
-        setTimeout(async () => {
-          try {
-            await this.destroyClient(tenantId);
-            await this.cleanupSessionFiles(tenantId);
-            await this.initClient(tenantId);
-          } catch (e) {
-            console.error(`❌ [Tenant ${tid}] Session cleanup retry failed:`, e.message);
-          }
-        }, 10000);
+        // Try reconnecting with existing session first (no QR), only wipe session if 2nd attempt also fails
+        const attempt = (this._authFailCounts?.get(tid) || 0) + 1;
+        if (!this._authFailCounts) this._authFailCounts = new Map();
+        this._authFailCounts.set(tid, attempt);
+        if (attempt <= 2) {
+          console.log(`🔄 [Tenant ${tid}] Auth failure (attempt ${attempt}/2), retrying with saved session in 10s...`);
+          setTimeout(async () => {
+            try {
+              await this.destroyClient(tenantId);
+              await this.initClient(tenantId);
+            } catch (e) {
+              console.error(`❌ [Tenant ${tid}] Reconnect failed:`, e.message);
+            }
+          }, 10000);
+        } else {
+          // Session truly corrupted — wipe and re-init (will show QR)
+          this._authFailCounts.delete(tid);
+          console.log(`🔄 [Tenant ${tid}] Session corrupted after 2 attempts, wiping and re-scanning QR...`);
+          setTimeout(async () => {
+            try {
+              await this.destroyClient(tenantId);
+              await this.cleanupSessionFiles(tenantId);
+              await this.initClient(tenantId);
+            } catch (e) {
+              console.error(`❌ [Tenant ${tid}] Session wipe retry failed:`, e.message);
+            }
+          }, 10000);
+        }
       }
+    });
+
+    client.on('authenticated', () => {
+      // Reset auth fail counter on successful auth
+      if (this._authFailCounts) this._authFailCounts.delete(tid);
+      state.initializing = false;
+      console.log(`🔐 [Tenant ${tid}] WhatsApp authenticated`);
+      // Capture browser PID for safe cleanup later
+      try {
+        const proc = client.pupBrowser?.process();
+        if (proc) state.browserPid = proc.pid;
+      } catch (_) {}
     });
 
     client.on('disconnected', (reason) => {
@@ -217,13 +236,15 @@ class TenantWAManager {
       const reasonStr = String(reason || '').toUpperCase();
       if (reasonStr.includes('CONFLICT') || reasonStr.includes('BANNED') || reasonStr === '401') {
         state.manualStatus = 'banned';
-      } else if (reason !== 'LOGOUT') {
-        console.log(`🔄 [Tenant ${tid}] Reconnecting in 15s (full re-init)...`);
+      } else {
+        // Auto-reconnect for ALL reasons including LOGOUT — session files are preserved so no QR needed
+        const delayMs = reasonStr === 'LOGOUT' ? 5000 : 15000;
+        console.log(`🔄 [Tenant ${tid}] Reconnecting in ${delayMs / 1000}s using saved session (no QR needed)...`);
         setTimeout(() => {
           this.destroyClient(tenantId)
             .then(() => this.initClient(tenantId))
             .catch(e => console.error(`❌ [Tenant ${tid}] Reconnect failed:`, e.message));
-        }, 15000);
+        }, delayMs);
       }
     });
 
@@ -286,7 +307,7 @@ class TenantWAManager {
 
         const msgId = msg.id?._serialized;
         if (isDuplicate(tid, msgId)) return;
-
+        
         const waJid = msg.from;
         console.log(`📩 [Tenant ${tid}] Incoming from ${phone}: ${body.substring(0, 50)}`);
 
@@ -424,9 +445,18 @@ class TenantWAManager {
           if (num) {
             await supabase.from('leads').update({ real_phone: num }).eq('id', lead.id);
             resolved++;
+          } else {
+            // fallback: use JID phone so field is never blank
+            await supabase.from('leads').update({ real_phone: lead.phone }).eq('id', lead.id);
           }
+        } else {
+          // fallback: use JID phone so field is never blank
+          await supabase.from('leads').update({ real_phone: lead.phone }).eq('id', lead.id);
         }
-      } catch (_) {}
+      } catch (_) {
+        // fallback: use JID phone so field is never blank
+        try { await supabase.from('leads').update({ real_phone: lead.phone }).eq('id', lead.id); } catch (_2) {}
+      }
       await delay(2000);
     }
     console.log(`✅ [Tenant ${tid}] Bulk resolved ${resolved}/${leads.length} phone numbers`);
@@ -537,11 +567,25 @@ class TenantWAManager {
   async cleanupSessionFiles(tenantId) {
     const tid = String(tenantId);
     const sessionDir = path.join(__dirname, '.wwebjs_auth', `session-tenant_${tid}`);
-    try {
-      await fs.promises.rm(sessionDir, { recursive: true, force: true });
-      console.log(`🧹 [Tenant ${tid}] Session files deleted: ${sessionDir}`);
-    } catch (e) {
-      console.warn(`⚠️  [Tenant ${tid}] Could not delete session dir: ${e.message}`);
+
+    // Retry up to 5 times — Windows holds file locks briefly after Chromium exits
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        await fs.promises.rm(sessionDir, { recursive: true, force: true });
+        console.log(`🧹 [Tenant ${tid}] Session files deleted: ${sessionDir}`);
+        return;
+      } catch (e) {
+        if (e.code === 'EBUSY' || e.code === 'EPERM' || e.code === 'ENOTEMPTY') {
+          if (attempt < 5) {
+            await new Promise(r => setTimeout(r, attempt * 1500)); // 1.5s, 3s, 4.5s, 6s
+          } else {
+            console.warn(`⚠️  [Tenant ${tid}] Session dir partially locked, skipping: ${e.message}`);
+          }
+        } else {
+          console.warn(`⚠️  [Tenant ${tid}] Could not delete session dir: ${e.message}`);
+          return;
+        }
+      }
     }
   }
 
@@ -898,10 +942,8 @@ app.post('/api/admin/tenants/:id/connect-wa', adminAuth, async (req, res) => {
 app.post('/api/admin/tenants/:id/disconnect-wa', adminAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    const client = waManager.getClient(id);
-    if (client) {
-      try { await client.logout(); } catch (e) {}
-    }
+    // Only destroy the browser process — do NOT call client.logout() which wipes the session
+    // This preserves the saved session so reconnect works without QR
     await waManager.destroyClient(id);
     res.json({ success: true });
   } catch (err) {
@@ -1386,16 +1428,14 @@ app.post('/api/leads/:phone/resolve', tenantAuth, async (req, res) => {
       const contact = await client.getContactById(jid);
       if (contact?.number) {
         const num = contact.number.replace(/\D/g, '');
-        if (num && num !== phone) resolved = num;
+        if (num) resolved = num;
       }
     } catch (e) {}
 
-    if (resolved) {
-      await supabase.from('leads').update({ real_phone: resolved }).eq('id', lead.id);
-      res.json({ success: true, real_phone: resolved });
-    } else {
-      res.json({ success: false, message: 'Could not resolve. Enter manually.' });
-    }
+    // Always save — fallback to JID phone if getContactById returned nothing
+    if (!resolved) resolved = phone;
+    await supabase.from('leads').update({ real_phone: resolved }).eq('id', lead.id);
+    res.json({ success: true, real_phone: resolved });
   } catch (err) {
     res.status(500).json({ error: 'Failed to resolve phone' });
   }
@@ -1812,7 +1852,7 @@ app.get('/api/active-chats', tenantAuth, async (req, res) => {
           .eq('tenant_id', req.tenantId).eq('phone', lead.phone)
           .eq('direction', 'incoming').eq('status', 'received');
 
-        return { ...lead, last_message: msgs?.[0] || null, unread_count: unreadRes.count || 0 };
+        return { ...lead, real_phone: lead.real_phone || lead.phone, last_message: msgs?.[0] || null, unread_count: unreadRes.count || 0 };
       })
     );
 
@@ -1897,6 +1937,8 @@ process.on('SIGINT', async () => {
 });
 
 process.on('unhandledRejection', (err) => {
+  // Suppress Windows file-lock errors from Chromium session cleanup
+  if (err && (err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'ENOTEMPTY')) return;
   console.error('Unhandled rejection:', err.message);
 });
 
