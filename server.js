@@ -970,10 +970,9 @@ app.post('/api/admin/storage/cleanup-orphans', adminAuth, async (req, res) => {
 // ══════════════════════════════════════════════
 
 // ── Health / Status ─────────────────────────
-app.get('/api/health', tenantAuth, (req, res) => {
-  const status = waManager.getStatus(req.tenantId);
+app.get('/api/health', (req, res) => {
   res.json({
-    status: 'ok', whatsapp: status,
+    status: 'ok',
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString()
   });
