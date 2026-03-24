@@ -1,9 +1,11 @@
 services:
   - type: web
     name: whatsapp-crm-pro
-    runtime: docker
+    runtime: node
     region: oregon
-    plan: starter
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
     healthCheckPath: /api/health
     envVars:
       - key: SUPABASE_URL
@@ -24,7 +26,7 @@ services:
         value: "60000"
       - key: RATE_LIMIT_MAX
         value: "30"
-    disk:
-      name: wwebjs-data
-      mountPath: /data
-      sizeGB: 1
+      - key: WEBHOOK_VERIFY_TOKEN
+        sync: false
+      - key: GRAPH_API_VERSION
+        value: "v21.0"

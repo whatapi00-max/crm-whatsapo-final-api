@@ -1,22 +1,22 @@
 # WhatsApp CRM Pro
 
-PC-Only WhatsApp CRM with Supabase backend, modern UI, and Meta Ads integration.
-
-**Zero phone dependency** after first QR scan (WhatsApp multi-device).
+Multi-tenant WhatsApp CRM powered by the **official WhatsApp Cloud API** with Supabase backend and modern UI.
 
 ---
 
 ## Features
 
-- **WhatsApp Web.js** with LocalAuth — session persists forever after one QR scan
+- **WhatsApp Cloud API** — official Meta API, no browser/phone dependency
+- **Multi-Tenant** — admin creates tenants, each with their own WA number
 - **Supabase PostgreSQL** — free cloud database, real-time sync
 - **Modern UI** — TailwindCSS, dark/light mode, glassmorphism, responsive
-- **Live Chat** — 5-second auto-refresh, chat bubbles, typing indicator
+- **Live Chat** — auto-refresh, chat bubbles, typing indicator
 - **Lead Management** — status pipeline (New → Contacted → Interested → Sold)
 - **Revenue Tracking** — per-lead revenue, pipeline chart
 - **Quick Replies** — pre-saved message templates
-- **Meta Ads Integration** — auto-captures "Click-to-WhatsApp" leads
-- **Anti-Ban** — configurable message delays (default 2.5s)
+- **Auto Replies** — keyword-based automatic responses
+- **Scheduled Messages** — send messages at a specific time
+- **Broadcast** — bulk messaging with configurable delays
 - **Rate Limiting** — express-rate-limit for API protection
 
 ---
@@ -24,91 +24,58 @@ PC-Only WhatsApp CRM with Supabase backend, modern UI, and Meta Ads integration.
 ## Requirements
 
 - **Node.js** 18+ ([download](https://nodejs.org/))
-- **Google Chrome** or Chromium (for Puppeteer)
 - **Supabase account** (free tier — [supabase.com](https://supabase.com))
+- **Meta Developer Account** with WhatsApp Cloud API access
 
 ---
 
-## Setup Guide (Windows)
+## Setup Guide
 
 ### Step 1: Install Node.js
 
 1. Download Node.js 18+ LTS from https://nodejs.org/
 2. Run installer → check "Add to PATH"
-3. Verify: open PowerShell → `node --version` → should show v18+
 
 ### Step 2: Create Supabase Project
 
 1. Go to https://supabase.com and sign up (free)
 2. Click **"New Project"**
-3. Choose a name, set database password, select region
-4. Wait for project to provision (~2 minutes)
-5. Go to **Settings → API**:
-   - Copy **Project URL** → this is your `SUPABASE_URL`
-   - Copy **anon/public key** → this is your `SUPABASE_KEY`
+3. Go to **Settings → API** and copy your **Project URL** and **anon key**
 
 ### Step 3: Create Database Tables
 
 1. In Supabase Dashboard → **SQL Editor** → **New Query**
-2. Paste the entire contents of `supabase.sql`
-3. Click **Run** — all tables, indexes, and seed data will be created
+2. Paste the contents of `supabase.sql`, then run
+3. If upgrading, also run `migrate-cloud-api.sql`
 
 ### Step 4: Configure Environment
-
-```bash
-cd whatsapp-crm-pro
-copy .env.example .env
-```
 
 Edit `.env` with your values:
 ```
 SUPABASE_URL=https://your-project-id.supabase.co
-SUPABASE_KEY=eyJhbGciOiJIUzI1NiIs...your-key-here
+SUPABASE_KEY=your-anon-key
+JWT_SECRET=your-secret
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=yourpassword
+WEBHOOK_VERIFY_TOKEN=your-verify-token
+GRAPH_API_VERSION=v21.0
 PORT=3000
-MESSAGE_DELAY_MS=2500
 ```
 
 ### Step 5: Install & Run
 
 ```bash
 npm install
-npm run dev
+node server.js
 ```
 
-### Step 6: Scan QR Code
+### Step 6: Configure WhatsApp Cloud API
 
-1. A QR code appears in the terminal
-2. Open **WhatsApp** on your phone → **Settings** → **Linked Devices** → **Link a Device**
-3. Scan the QR code
-4. Done! Session is saved permanently. Phone can go offline after this.
-
-### Step 7: Open Dashboard
-
-Open browser → http://localhost:3000
-
----
-
-## Meta Ads "Click-to-WhatsApp" Setup
-
-### Configure Meta Business Suite
-
-1. Go to **Meta Business Suite** → **Ads Manager**
-2. Create a new campaign → Choose **Messages** objective
-3. Select **Click to WhatsApp** as destination
-4. Set your WhatsApp Business number
-5. In ad creative, set the greeting message to include a keyword like `"TIPS"`:
-   - Example: *"Reply TIPS to get our exclusive guide!"*
-
-### How It Works
-
-```
-User clicks Meta Ad → WhatsApp opens → User sends "TIPS"
-→ Your PC captures the message automatically
-→ Saved to Supabase with source = "meta_ads"
-→ CRM Dashboard shows instantly with Meta Ad badge
-→ You reply manually from CRM → WhatsApp delivers instantly
-→ Full conversation history tracked
-```
+1. Go to [Meta Developer Dashboard](https://developers.facebook.com/)
+2. Create an app → Add **WhatsApp** product
+3. Get your **Phone Number ID**, **Access Token**, and **WABA ID**
+4. In the admin panel, click **Configure API** on a tenant and enter these credentials
+5. Set your webhook URL to `https://your-server.com/webhook` with your verify token
 
 ---
 
@@ -117,30 +84,18 @@ User clicks Meta Ad → WhatsApp opens → User sends "TIPS"
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/health` | Health check + WhatsApp status |
-| GET | `/api/qr-status` | QR code status for initial setup |
-| POST | `/api/send-reply` | Send message from CRM → WhatsApp |
-| GET | `/api/messages` | Get all messages (with optional `?phone=` filter) |
-| GET | `/api/messages/:phone` | Get chat history for a specific contact |
-| POST | `/api/messages/:phone/read` | Mark messages as read |
-| GET | `/api/leads` | Get all leads (with optional `?status=` filter) |
-| PUT | `/api/leads/:phone` | Update lead details |
-| DELETE | `/api/leads/:phone` | Delete lead and all messages |
-| GET | `/api/active-chats` | Get leads with last message + unread count |
+| GET | `/api/connection-status` | Cloud API connection status |
+| POST | `/api/send-reply` | Send message via Cloud API |
+| GET | `/api/messages` | Get all messages |
+| GET | `/api/leads` | Get all leads |
+| GET | `/api/active-chats` | Get active conversations |
 | GET | `/api/stats` | Dashboard statistics |
-| GET | `/api/stats/revenue-by-status` | Revenue grouped by pipeline status |
-| GET | `/api/quick-replies` | Get quick reply templates |
-
-### Send a Message (cURL)
-
-```bash
-curl -X POST http://localhost:3000/api/send-reply ^
-  -H "Content-Type: application/json" ^
-  -d "{\"phone\":\"919876543210\",\"message\":\"Hello from CRM!\"}"
-```
+| GET | `/webhook` | Webhook verification (Meta) |
+| POST | `/webhook` | Incoming messages from Meta |
 
 ---
 
-## Production Deployment (Windows)
+## Production Deployment
 
 ### Auto-Restart with PM2
 
@@ -148,53 +103,13 @@ curl -X POST http://localhost:3000/api/send-reply ^
 npm install -g pm2
 pm2 start ecosystem.config.js
 pm2 save
-pm2 startup
 ```
 
-PM2 will auto-restart the server if it crashes and can start on Windows boot.
-
-### View Logs
+### Docker
 
 ```bash
-pm2 logs whatsapp-crm
+docker compose up -d
 ```
-
-### Monitor
-
-```bash
-pm2 monit
-```
-
----
-
-## File Structure
-
-```
-whatsapp-crm-pro/
-├── package.json          # Dependencies & scripts
-├── server.js             # Express API + WhatsApp client + Supabase
-├── supabase.sql          # Database schema (run in Supabase SQL Editor)
-├── ecosystem.config.js   # PM2 configuration
-├── .env.example          # Environment template
-├── .env                  # Your actual config (not in git)
-├── public/
-│   ├── index.html        # CRM Dashboard (TailwindCSS)
-│   ├── style.css         # Custom styles + animations
-│   └── script.js         # Frontend logic + auto-refresh
-├── docker-compose.yml    # Optional Docker setup
-└── README.md             # This file
-```
-
----
-
-## Anti-Ban Best Practices
-
-- **Message delay**: Default 2.5s between sends (configurable via `MESSAGE_DELAY_MS`)
-- **Rate limiting**: API calls limited to 30/minute by default
-- **No bulk sending**: This CRM is for manual, 1-to-1 conversations
-- **Use a dedicated number**: Don't use your personal WhatsApp
-- **Avoid links in first message**: WhatsApp flags link-heavy first contacts
-- **Warm up gradually**: Start with 10-20 replies/day, increase over weeks
 
 ---
 
@@ -202,11 +117,9 @@ whatsapp-crm-pro/
 
 | Issue | Fix |
 |-------|-----|
-| QR not appearing | Ensure Chrome/Chromium is installed. Delete `.wwebjs_auth` folder and restart. |
-| Session lost | Delete `.wwebjs_auth` folder → restart → re-scan QR |
-| Puppeteer crash | Run `npm install` again. On Windows, ensure Visual C++ Build Tools are installed. |
 | Supabase errors | Check `.env` values. Ensure tables exist (run `supabase.sql`). |
-| Messages not syncing | Check server logs. Ensure WhatsApp shows "Connected" in dashboard. |
+| Messages not syncing | Check webhook is configured in Meta Dashboard. |
+| Webhook not verifying | Ensure `WEBHOOK_VERIFY_TOKEN` matches in `.env` and Meta Dashboard. |
 | Port in use | Change `PORT` in `.env` or kill the process using that port. |
 
 ---

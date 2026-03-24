@@ -1,6 +1,4 @@
 node_modules
-.wwebjs_auth
-.wwebjs_cache
 .env
 .env.*
 !.env.example
@@ -10,4 +8,4 @@ logs
 *.md
 docker-compose.yml
 ecosystem.config.js
-*.bak
+*.old

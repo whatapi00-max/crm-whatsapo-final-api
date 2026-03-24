@@ -72,8 +72,6 @@
     }
     .badge-connected { background: rgba(37,211,102,0.12); color: #22c55e; }
     .badge-disconnected { background: rgba(239,68,68,0.1); color: #ef4444; }
-    .badge-qr { background: rgba(251,191,36,0.12); color: #f59e0b; }
-    .badge-init { background: rgba(99,102,241,0.12); color: #818cf8; }
     .badge-active { background: rgba(34,197,94,0.1); color: #22c55e; }
     .badge-inactive { background: rgba(107,114,128,0.12); color: #9ca3af; }
     .dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
@@ -506,15 +504,61 @@ Mike Wilson, mikew, mypass999
     </div>
   </div>
 
-  <!-- QR Modal -->
-  <div class="modal-bg hidden" id="modal-qr" onclick="if(event.target===this)closeQrModal()">
-    <div class="modal-box text-center">
-      <h3 class="text-lg font-bold dark:text-white text-gray-900 mb-1" id="qr-title">Connect WhatsApp</h3>
-      <p class="text-xs dark:text-gray-500 text-gray-400 mb-5" id="qr-subtitle">Scan this QR code with WhatsApp</p>
-      <div id="qr-container" class="py-4">
-        <div class="dark:text-gray-500 text-gray-400 text-sm py-8">Initializing...</div>
+  <!-- WhatsApp Cloud API Config Modal -->
+  <div class="modal-bg hidden" id="modal-wa-config" onclick="if(event.target===this)closeModal('modal-wa-config')">
+    <div class="modal-box" style="max-width:520px;">
+      <div class="flex items-center gap-3 mb-4">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-wa-green to-wa-teal flex items-center justify-center">
+          <svg class="w-5 h-5 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347"/></svg>
+        </div>
+        <div>
+          <h3 class="text-base font-bold dark:text-white text-gray-900" id="wa-config-title">Configure WhatsApp Cloud API</h3>
+          <p class="text-[11px] dark:text-gray-500 text-gray-400" id="wa-config-subtitle">Enter Meta Cloud API credentials</p>
+        </div>
       </div>
-      <button onclick="closeQrModal()" class="mt-2 w-full py-2.5 rounded-xl text-sm font-medium dark:bg-white/5 bg-gray-100 dark:text-gray-400 text-gray-500 hover:opacity-80 transition">Close</button>
+
+      <div id="wa-config-status" class="hidden mb-4 p-3 rounded-xl text-xs"></div>
+
+      <form id="wa-config-form" class="space-y-4" onsubmit="saveWAConfig(event)">
+        <input type="hidden" id="wac-tenant-id" value="">
+        <div>
+          <label class="block text-[10px] font-bold uppercase tracking-wider dark:text-gray-500 text-gray-400 mb-1.5">Phone Number ID</label>
+          <input type="text" id="wac-phone-id" class="field-input" placeholder="e.g. 123456789012345" required>
+          <p class="text-[9px] dark:text-gray-600 text-gray-400 mt-1">From Meta Developer Dashboard → WhatsApp → API Setup</p>
+        </div>
+        <div>
+          <label class="block text-[10px] font-bold uppercase tracking-wider dark:text-gray-500 text-gray-400 mb-1.5">Permanent Access Token</label>
+          <input type="password" id="wac-access-token" class="field-input" placeholder="EAAxxxxxxx..." required>
+          <p class="text-[9px] dark:text-gray-600 text-gray-400 mt-1">System user permanent token with whatsapp_business_messaging permission</p>
+        </div>
+        <div>
+          <label class="block text-[10px] font-bold uppercase tracking-wider dark:text-gray-500 text-gray-400 mb-1.5">Business Account ID <span class="font-normal">(optional)</span></label>
+          <input type="text" id="wac-waba-id" class="field-input" placeholder="e.g. 98765432101234">
+          <p class="text-[9px] dark:text-gray-600 text-gray-400 mt-1">WhatsApp Business Account ID (WABA ID)</p>
+        </div>
+        <div id="wa-config-error" class="text-red-500 text-xs text-center hidden"></div>
+        <div class="flex gap-2 pt-2">
+          <button type="button" class="flex-1 py-2.5 rounded-xl text-sm font-medium dark:bg-white/5 bg-gray-100 dark:text-gray-400 text-gray-500 hover:opacity-80 transition" onclick="closeModal('modal-wa-config')">Cancel</button>
+          <button type="submit" class="flex-1 btn-primary py-2.5 justify-center" id="wac-submit">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg>
+            Save & Verify
+          </button>
+        </div>
+      </form>
+
+      <div class="mt-4 p-3 rounded-xl text-left" style="background:rgba(59,130,246,0.05);border:1px solid rgba(59,130,246,0.1);">
+        <p class="text-[11px] font-bold dark:text-blue-400 text-blue-600 mb-2 flex items-center gap-1.5">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+          Where to find these credentials
+        </p>
+        <ol class="text-[10px] dark:text-gray-400 text-gray-500 space-y-1.5 list-decimal list-inside">
+          <li>Go to <b>developers.facebook.com</b> → Your App</li>
+          <li>Navigate to <b>WhatsApp → API Setup</b></li>
+          <li>Copy your <b>Phone Number ID</b> and <b>Access Token</b></li>
+          <li>For webhook, set URL to: <code class="dark:text-green-400 text-green-600 font-mono">{your-server}/webhook</code></li>
+          <li>Set verify token to match your server's <b>WEBHOOK_VERIFY_TOKEN</b></li>
+        </ol>
+      </div>
     </div>
   </div>
 

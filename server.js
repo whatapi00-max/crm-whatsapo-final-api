@@ -1,5 +1,6 @@
 // ============================================
 // Billy777 WhatsApp CRM - Multi-Tenant Server
+// WhatsApp Cloud API Edition
 // ============================================
 require('dotenv').config();
 
@@ -10,9 +11,6 @@ const rateLimit = require('express-rate-limit');
 const cookieParser = require('cookie-parser');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
-const QRCode = require('qrcode');
 const { createClient } = require('@supabase/supabase-js');
 const path = require('path');
 const fs = require('fs');
@@ -25,15 +23,18 @@ const MESSAGE_DELAY_MS = parseInt(process.env.MESSAGE_DELAY_MS) || 2500;
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
-const CHROME_PATH = process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium';
+const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN || 'billy777_verify';
+const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || 'v21.0';
 const BCRYPT_ROUNDS = 10;
-const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 if (!process.env.JWT_SECRET) {
   console.log('⚠️  JWT_SECRET not set in .env — using random secret (sessions won\'t persist across restarts)');
 }
 if (ADMIN_PASSWORD === 'admin123') {
   console.log('⚠️  Using default admin password! Set ADMIN_PASSWORD in .env for production');
+}
+if (!process.env.WEBHOOK_VERIFY_TOKEN) {
+  console.log('⚠️  WEBHOOK_VERIFY_TOKEN not set in .env — using default "billy777_verify"');
 }
 
 // ── Supabase Client ─────────────────────────
@@ -59,327 +60,132 @@ function isDuplicate(tenantId, msgId) {
   const s = processedMsgIds.get(tenantId);
   if (s.has(msgId)) return true;
   s.add(msgId);
-  if (s.size > 1000) {
+  if (s.size > 5000) {
     const arr = [...s];
-    arr.slice(0, 500).forEach(id => s.delete(id));
+    arr.slice(0, 2500).forEach(id => s.delete(id));
   }
   return false;
 }
 
 // ══════════════════════════════════════════════
-// TENANT WA CLIENT MANAGER
+// WHATSAPP CLOUD API MANAGER
 // ══════════════════════════════════════════════
-class TenantWAManager {
+class CloudAPIManager {
   constructor() {
-    this.clients = new Map(); // tenantId -> { client, ready, qrCode, manualStatus, scheduledInterval, initializing }
+    this.configs = new Map(); // tenantId -> { phone_number_id, access_token, waba_id }
+    this.scheduledIntervals = new Map();
   }
 
-  getState(tenantId) {
-    return this.clients.get(String(tenantId)) || null;
+  getConfig(tenantId) {
+    return this.configs.get(String(tenantId)) || null;
   }
 
   isReady(tenantId) {
-    const s = this.getState(tenantId);
-    return s ? s.ready : false;
-  }
-
-  getQR(tenantId) {
-    const s = this.getState(tenantId);
-    return s ? s.qrCode : null;
-  }
-
-  getClient(tenantId) {
-    const s = this.getState(tenantId);
-    return s ? s.client : null;
+    const cfg = this.getConfig(tenantId);
+    return !!(cfg && cfg.phone_number_id && cfg.access_token);
   }
 
   getStatus(tenantId) {
-    const s = this.getState(tenantId);
-    if (!s) return 'not_initialized';
-    if (s.manualStatus === 'banned') return 'banned';
-    if (s.ready) return 'connected';
-    if (s.qrCode) return 'waiting_qr';
-    if (s.initializing) return 'initializing';
-    return 'disconnected';
+    const cfg = this.getConfig(tenantId);
+    if (!cfg) return 'not_configured';
+    if (cfg.phone_number_id && cfg.access_token) return 'connected';
+    return 'not_configured';
   }
 
-  async initClient(tenantId) {
+  async loadFromDB(tenantId) {
     const tid = String(tenantId);
+    const { data: tenant } = await supabase.from('tenants')
+      .select('wa_phone_number_id, wa_access_token, wa_waba_id')
+      .eq('id', tenantId).maybeSingle();
 
-    // Prevent concurrent init for the same tenant
-    if (this._initLocks && this._initLocks.has(tid)) {
-      console.log(`⚠️  [Tenant ${tid}] Init already in progress, skipping`);
-      return this.getState(tid);
-    }
-    if (!this._initLocks) this._initLocks = new Set();
-    this._initLocks.add(tid);
-
-    try {
-      return await this._doInitClient(tenantId);
-    } finally {
-      this._initLocks.delete(tid);
-    }
-  }
-
-  async _doInitClient(tenantId) {
-    const tid = String(tenantId);
-    if (this.clients.has(tid) && this.clients.get(tid).client) {
-      console.log(`⚠️  Client for tenant ${tid} already exists, destroying first...`);
-      await this.destroyClient(tenantId);
-    }
-
-    // Remove stale browser lock files before starting
-    this._removeBrowserLockSync(tid);
-
-    const client = new Client({
-      authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth', clientId: `tenant_${tid}` }),
-      webVersionCache: { type: 'none' },
-      puppeteer: {
-        headless: true,
-        executablePath: CHROME_PATH,
-        args: [
-          '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas', '--no-first-run', '--disable-gpu',
-          '--disable-extensions', '--disable-background-networking', '--disable-default-apps',
-          '--disable-sync', '--disable-translate', '--hide-scrollbars',
-          '--metrics-recording-only', '--mute-audio', '--no-default-browser-check',
-          '--safebrowsing-disable-auto-update',
-          '--no-zygote',
-          '--disable-software-rasterizer', '--disable-features=site-per-process',
-          '--disable-component-update',
-          '--disable-domain-reliability',
-          '--disable-print-preview',
-          '--disable-speech-api',
-          '--disk-cache-size=0',
-          '--media-cache-size=0',
-          '--js-flags=--max-old-space-size=64 --lite-mode --optimize-for-size --gc-interval=100'
-        ],
-        timeout: 60000
-      }
-    });
-
-    const state = { client, ready: false, qrCode: null, manualStatus: null, scheduledInterval: null, initializing: true, browserPid: null };
-    this.clients.set(tid, state);
-
-    client.on('qr', (qr) => {
-      state.qrCode = qr;
-      state.initializing = false;
-      console.log(`📱 [Tenant ${tid}] QR code generated`);
-      qrcode.generate(qr, { small: true });
-    });
-
-    client.on('ready', () => {
-      state.ready = true;
-      state.qrCode = null;
-      state.initializing = false;
-      console.log(`✅ [Tenant ${tid}] WhatsApp client READY`);
+    if (tenant && tenant.wa_phone_number_id && tenant.wa_access_token) {
+      this.configs.set(tid, {
+        phone_number_id: tenant.wa_phone_number_id,
+        access_token: tenant.wa_access_token,
+        waba_id: tenant.wa_waba_id || null
+      });
       this.startScheduledChecker(tenantId);
-      // Skip bulkResolveRealPhones to save memory on 512MB instances
-    });
-
-    client.on('auth_failure', (msg) => {
-      console.error(`❌ [Tenant ${tid}] Auth failure:`, msg);
-      state.ready = false;
-      state.initializing = false;
-      const msgStr = String(msg || '').toUpperCase();
-      if (msgStr.includes('401') || msgStr.includes('CONFLICT') || msgStr.includes('BANNED')) {
-        state.manualStatus = 'banned';
-      } else {
-        // Try reconnecting with existing session first (no QR), only wipe session if 2nd attempt also fails
-        const attempt = (this._authFailCounts?.get(tid) || 0) + 1;
-        if (!this._authFailCounts) this._authFailCounts = new Map();
-        this._authFailCounts.set(tid, attempt);
-        if (attempt <= 2) {
-          console.log(`🔄 [Tenant ${tid}] Auth failure (attempt ${attempt}/2), retrying with saved session in 10s...`);
-          setTimeout(async () => {
-            try {
-              await this.destroyClient(tenantId);
-              await this.initClient(tenantId);
-            } catch (e) {
-              console.error(`❌ [Tenant ${tid}] Reconnect failed:`, e.message);
-            }
-          }, 10000);
-        } else {
-          // Session truly corrupted — wipe and re-init (will show QR)
-          this._authFailCounts.delete(tid);
-          console.log(`🔄 [Tenant ${tid}] Session corrupted after 2 attempts, wiping and re-scanning QR...`);
-          setTimeout(async () => {
-            try {
-              await this.destroyClient(tenantId);
-              await this.cleanupSessionFiles(tenantId);
-              await this.initClient(tenantId);
-            } catch (e) {
-              console.error(`❌ [Tenant ${tid}] Session wipe retry failed:`, e.message);
-            }
-          }, 10000);
-        }
-      }
-    });
-
-    client.on('authenticated', () => {
-      // Reset auth fail counter on successful auth
-      if (this._authFailCounts) this._authFailCounts.delete(tid);
-      state.initializing = false;
-      console.log(`🔐 [Tenant ${tid}] WhatsApp authenticated`);
-      // Capture browser PID for safe cleanup later
-      try {
-        const proc = client.pupBrowser?.process();
-        if (proc) state.browserPid = proc.pid;
-      } catch (_) {}
-    });
-
-    client.on('disconnected', (reason) => {
-      console.log(`⚠️  [Tenant ${tid}] Disconnected:`, reason);
-      state.ready = false;
-      state.qrCode = null;
-      state.initializing = false;
-      const reasonStr = String(reason || '').toUpperCase();
-      if (reasonStr.includes('CONFLICT') || reasonStr.includes('BANNED') || reasonStr === '401') {
-        state.manualStatus = 'banned';
-      } else {
-        // Auto-reconnect for ALL reasons including LOGOUT — session files are preserved so no QR needed
-        const delayMs = reasonStr === 'LOGOUT' ? 5000 : 15000;
-        console.log(`🔄 [Tenant ${tid}] Reconnecting in ${delayMs / 1000}s using saved session (no QR needed)...`);
-        setTimeout(() => {
-          this.destroyClient(tenantId)
-            .then(() => this.initClient(tenantId))
-            .catch(e => console.error(`❌ [Tenant ${tid}] Reconnect failed:`, e.message));
-        }, delayMs);
-      }
-    });
-
-    // Message handlers
-    this.setupMessageHandlers(tenantId, client);
-
-    console.log(`⏳ [Tenant ${tid}] Initializing WhatsApp client...`);
-
-    // Track retry count to avoid infinite loops
-    if (!this._retryCounts) this._retryCounts = new Map();
-    const retryCount = this._retryCounts.get(tid) || 0;
-    const MAX_RETRIES = 3;
-
-    // Initialize with timeout so it doesn't hang forever
-    const INIT_TIMEOUT_MS = 120000;
-    await Promise.race([
-      client.initialize(),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Client init timed out')), INIT_TIMEOUT_MS)
-      )
-    ]).then(() => {
-      // Success — reset retry counter and capture browser PID
-      this._retryCounts.delete(tid);
-      try {
-        const proc = client.pupBrowser?.process();
-        if (proc) state.browserPid = proc.pid;
-      } catch (_) {}
-    }).catch(async (err) => {
-      console.error(`❌ [Tenant ${tid}] Init error (attempt ${retryCount + 1}/${MAX_RETRIES}): ${err.message}`);
-      state.initializing = false;
-
-      // Fully destroy the failed client and its browser
-      await this.destroyClient(tenantId);
-
-      if (retryCount < MAX_RETRIES && !state.qrCode && !state.ready) {
-        this._retryCounts.set(tid, retryCount + 1);
-        const delayMs = 15000 + (retryCount * 10000); // 15s, 25s, 35s
-        console.log(`🔄 [Tenant ${tid}] Will retry init in ${delayMs / 1000}s...`);
-        setTimeout(() => {
-          this.initClient(tenantId).catch(() => {});
-        }, delayMs);
-      } else if (retryCount >= MAX_RETRIES) {
-        console.error(`🚫 [Tenant ${tid}] Max retries reached. Use admin panel to reconnect manually.`);
-        this._retryCounts.delete(tid);
-      }
-    });
-
-    return state;
+      console.log(`✅ [Tenant ${tid}] Cloud API config loaded (Phone ID: ${tenant.wa_phone_number_id})`);
+      return true;
+    }
+    return false;
   }
 
-  setupMessageHandlers(tenantId, client) {
+  async saveConfig(tenantId, phoneNumberId, accessToken, wabaId) {
     const tid = String(tenantId);
 
-    client.on('message', async (msg) => {
-      try {
-        if (msg.from.includes('@g.us') || msg.from === 'status@broadcast') return;
-        let phone = cleanPhone(msg.from);
-        const body = msg.body || '';
-        if (!phone) return;
+    const { error } = await supabase.from('tenants')
+      .update({
+        wa_phone_number_id: phoneNumberId || null,
+        wa_access_token: accessToken || null,
+        wa_waba_id: wabaId || null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', tenantId);
+    if (error) throw error;
 
-        const msgId = msg.id?._serialized;
-        if (isDuplicate(tid, msgId)) return;
-        
-        const waJid = msg.from;
-        console.log(`📩 [Tenant ${tid}] Incoming from ${phone}: ${body.substring(0, 50)}`);
-
-        await supabase.from('conversations').insert({
-          tenant_id: tenantId, phone, message: body,
-          direction: 'incoming', status: 'received'
-        });
-
-        const { data: existingLead } = await supabase.from('leads')
-          .select('id, phone').eq('tenant_id', tenantId).eq('phone', phone).maybeSingle();
-
-        // Use phone from JID directly (skip getContact to save memory)
-        const realPhone = phone;
-
-        const isNew = !existingLead;
-        if (!existingLead) {
-          let source = 'organic';
-          const lowerBody = body.toLowerCase();
-          if (lowerBody.includes('tips') || lowerBody.includes('ad')) source = 'meta_ads';
-
-          const leadData = {
-            tenant_id: tenantId, phone, wa_jid: waJid,
-            name: msg._data?.notifyName || 'Unknown',
-            source, status: 'new', last_message_at: new Date().toISOString()
-          };
-          if (realPhone) leadData.real_phone = realPhone;
-
-          await supabase.from('leads').insert(leadData);
-
-          try {
-            await supabase.from('activity_log').insert({
-              tenant_id: tenantId, phone, action: 'lead_created',
-              details: `New lead from ${source}: ${msg._data?.notifyName || 'Unknown'}`
-            });
-          } catch (_) {}
-        } else {
-          const updateData = {
-            last_message_at: new Date().toISOString(), wa_jid: waJid
-          };
-          if (realPhone) updateData.real_phone = realPhone;
-
-          await supabase.from('leads').update(updateData)
-            .eq('tenant_id', tenantId).eq('phone', phone);
-        }
-
-        if (this.isReady(tenantId)) {
-          await this.checkAutoReply(tenantId, phone, body, isNew);
-        }
-      } catch (err) {
-        console.error(`❌ [Tenant ${tid}] Incoming message error:`, err.message);
-      }
-    });
-
-    client.on('message_create', async (msg) => {
-      if (!msg.fromMe) return;
-      try {
-        if (msg.to.includes('@g.us') || msg.to === 'status@broadcast') return;
-        const phone = cleanPhone(msg.to);
-        if (!phone) return;
-        const msgId = msg.id?._serialized;
-        if (isDuplicate(tid, msgId)) return;
-
-        await supabase.from('conversations').insert({
-          tenant_id: tenantId, phone, message: msg.body || '',
-          direction: 'outgoing', status: 'sent'
-        });
-      } catch (err) {
-        console.error(`❌ [Tenant ${tid}] Outgoing message error:`, err.message);
-      }
-    });
+    if (phoneNumberId && accessToken) {
+      this.configs.set(tid, {
+        phone_number_id: phoneNumberId,
+        access_token: accessToken,
+        waba_id: wabaId || null
+      });
+      this.startScheduledChecker(tenantId);
+    } else {
+      this.removeConfig(tenantId);
+    }
   }
 
+  removeConfig(tenantId) {
+    const tid = String(tenantId);
+    const interval = this.scheduledIntervals.get(tid);
+    if (interval) clearInterval(interval);
+    this.scheduledIntervals.delete(tid);
+    this.configs.delete(tid);
+  }
+
+  // Find tenant by phone_number_id (for webhook routing)
+  findTenantByPhoneNumberId(phoneNumberId) {
+    for (const [tid, cfg] of this.configs) {
+      if (cfg.phone_number_id === phoneNumberId) return parseInt(tid);
+    }
+    return null;
+  }
+
+  // ── Send Message via Cloud API ────────────
+  async sendMessage(tenantId, to, text) {
+    const cfg = this.getConfig(tenantId);
+    if (!cfg || !cfg.phone_number_id || !cfg.access_token) {
+      throw new Error('WhatsApp Cloud API not configured for this tenant');
+    }
+
+    const cleanedTo = String(to).replace(/\D/g, '');
+    const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${cfg.phone_number_id}/messages`;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${cfg.access_token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: cleanedTo,
+        type: 'text',
+        text: { preview_url: false, body: text }
+      })
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      const errMsg = data.error?.message || data.error?.error_data?.details || JSON.stringify(data.error) || 'Cloud API error';
+      throw new Error(errMsg);
+    }
+    return data;
+  }
+
+  // ── Auto-Reply Check ──────────────────────
   async checkAutoReply(tenantId, phone, body, isNew) {
     try {
       const { data: rules } = await supabase.from('auto_replies')
@@ -404,11 +210,12 @@ class TenantWAManager {
           await supabase.from('auto_replies').update({ usage_count: (rule.usage_count || 0) + 1 }).eq('id', rule.id);
           setTimeout(async () => {
             try {
-              const { data: lead } = await supabase.from('leads').select('wa_jid')
-                .eq('tenant_id', tenantId).eq('phone', phone).maybeSingle();
-              const chatId = lead?.wa_jid || phone + '@c.us';
-              const client = this.getClient(tenantId);
-              if (client) await client.sendMessage(chatId, rule.reply_message);
+              await this.sendMessage(tenantId, phone, rule.reply_message);
+              // Store auto-reply in conversations
+              await supabase.from('conversations').insert({
+                tenant_id: tenantId, phone, message: rule.reply_message,
+                direction: 'outgoing', status: 'sent'
+              });
               console.log(`🤖 [Tenant ${tenantId}] Auto-reply sent to ${phone}`);
             } catch (e) { console.error('⚠️  Auto-reply send error:', e.message); }
           }, 1500);
@@ -420,57 +227,15 @@ class TenantWAManager {
     }
   }
 
-  async bulkResolveRealPhones(tenantId) {
-    const tid = String(tenantId);
-    const client = this.getClient(tenantId);
-    if (!client) return;
-
-    const { data: leads } = await supabase.from('leads')
-      .select('id, phone, wa_jid, real_phone')
-      .eq('tenant_id', tenantId)
-      .or('real_phone.is.null,real_phone.eq.')
-      .limit(10);
-
-    if (!leads || leads.length === 0) return;
-    console.log(`🔍 [Tenant ${tid}] Bulk resolving real phones for ${leads.length} leads...`);
-
-    let resolved = 0;
-    for (const lead of leads) {
-      if (!this.isReady(tenantId)) break;
-      try {
-        const jid = lead.wa_jid || lead.phone + '@c.us';
-        const contact = await client.getContactById(jid);
-        if (contact?.number) {
-          const num = contact.number.replace(/\D/g, '');
-          if (num) {
-            await supabase.from('leads').update({ real_phone: num }).eq('id', lead.id);
-            resolved++;
-          } else {
-            // fallback: use JID phone so field is never blank
-            await supabase.from('leads').update({ real_phone: lead.phone }).eq('id', lead.id);
-          }
-        } else {
-          // fallback: use JID phone so field is never blank
-          await supabase.from('leads').update({ real_phone: lead.phone }).eq('id', lead.id);
-        }
-      } catch (_) {
-        // fallback: use JID phone so field is never blank
-        try { await supabase.from('leads').update({ real_phone: lead.phone }).eq('id', lead.id); } catch (_2) {}
-      }
-      await delay(2000);
-    }
-    console.log(`✅ [Tenant ${tid}] Bulk resolved ${resolved}/${leads.length} phone numbers`);
-  }
-
+  // ── Scheduled Message Checker ─────────────
   startScheduledChecker(tenantId) {
     const tid = String(tenantId);
-    const state = this.clients.get(tid);
-    if (!state) return;
-    if (state.scheduledInterval) clearInterval(state.scheduledInterval);
+    const existing = this.scheduledIntervals.get(tid);
+    if (existing) clearInterval(existing);
 
-    state.scheduledInterval = setInterval(async () => {
+    const interval = setInterval(async () => {
       try {
-        if (!state.ready) return;
+        if (!this.isReady(tenantId)) return;
         const { data: pending } = await supabase.from('scheduled_messages')
           .select('*').eq('tenant_id', tenantId).eq('status', 'pending')
           .lte('scheduled_at', new Date().toISOString())
@@ -481,12 +246,13 @@ class TenantWAManager {
         for (const sm of pending) {
           try {
             const cleanedPhone = sm.phone.replace(/\D/g, '');
-            const { data: lead } = await supabase.from('leads').select('wa_jid')
-              .eq('tenant_id', tenantId).eq('phone', cleanedPhone).maybeSingle();
-            const chatId = lead?.wa_jid || cleanedPhone + '@c.us';
-
             await delay(MESSAGE_DELAY_MS);
-            await state.client.sendMessage(chatId, sm.message);
+            await this.sendMessage(tenantId, cleanedPhone, sm.message);
+            // Store in conversations
+            await supabase.from('conversations').insert({
+              tenant_id: tenantId, phone: cleanedPhone, message: sm.message,
+              direction: 'outgoing', status: 'sent'
+            });
             await supabase.from('scheduled_messages')
               .update({ status: 'sent', sent_at: new Date().toISOString() }).eq('id', sm.id);
             console.log(`⏰ [Tenant ${tid}] Scheduled message sent to ${cleanedPhone}`);
@@ -499,104 +265,20 @@ class TenantWAManager {
         console.error(`⚠️  [Tenant ${tid}] Scheduled checker error:`, err.message);
       }
     }, 30000);
+
+    this.scheduledIntervals.set(tid, interval);
   }
 
-  async destroyClient(tenantId) {
-    const tid = String(tenantId);
-    const state = this.clients.get(tid);
-    if (!state) {
-      this._removeBrowserLockSync(tid);
-      return;
+  destroyAll() {
+    for (const [tid, interval] of this.scheduledIntervals) {
+      clearInterval(interval);
     }
-    if (state.scheduledInterval) clearInterval(state.scheduledInterval);
-
-    // 1. Try graceful destroy (with timeout — don't let it hang)
-    try {
-      await Promise.race([
-        state.client.destroy(),
-        new Promise(r => setTimeout(r, 8000))
-      ]);
-    } catch (e) {
-      console.log(`⚠️  [Tenant ${tid}] Graceful destroy failed: ${e.message}`);
-    }
-
-    // 2. Force-kill the specific browser process by PID (safe — only kills THIS tenant's browser)
-    try {
-      const browser = state.client?.pupBrowser;
-      if (browser) {
-        const proc = browser.process();
-        if (proc && !proc.killed) {
-          proc.kill('SIGKILL');
-        }
-      }
-    } catch (_) {}
-    if (state.browserPid) {
-      try { process.kill(state.browserPid, 'SIGKILL'); } catch (_) {}
-    }
-
-    this.clients.delete(tid);
-
-    // 3. Wait for process to fully die
-    await new Promise(r => setTimeout(r, 2000));
-
-    // 4. Remove stale browser lock files
-    this._removeBrowserLockSync(tid);
-
-    console.log(`🛑 [Tenant ${tid}] Client destroyed (RAM cleared)`);
-  }
-
-  _removeBrowserLockSync(tenantId) {
-    const tid = String(tenantId);
-    // Check both the symlink path and the real data path (Docker: /app/.wwebjs_auth -> /data/.wwebjs_auth)
-    const sessionPaths = [
-      path.join(__dirname, '.wwebjs_auth', `session-tenant_${tid}`),
-      path.resolve('/data/.wwebjs_auth', `session-tenant_${tid}`)
-    ];
-    const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
-    for (const sessionDir of sessionPaths) {
-      for (const lockFile of lockFiles) {
-        try { fs.unlinkSync(path.join(sessionDir, lockFile)); } catch (_) {}
-      }
-      // Also check inside Default profile dir
-      for (const lockFile of lockFiles) {
-        try { fs.unlinkSync(path.join(sessionDir, 'Default', lockFile)); } catch (_) {}
-      }
-    }
-  }
-
-  async cleanupSessionFiles(tenantId) {
-    const tid = String(tenantId);
-    const sessionDir = path.join(__dirname, '.wwebjs_auth', `session-tenant_${tid}`);
-
-    // Retry up to 5 times — Windows holds file locks briefly after Chromium exits
-    for (let attempt = 1; attempt <= 5; attempt++) {
-      try {
-        await fs.promises.rm(sessionDir, { recursive: true, force: true });
-        console.log(`🧹 [Tenant ${tid}] Session files deleted: ${sessionDir}`);
-        return;
-      } catch (e) {
-        if (e.code === 'EBUSY' || e.code === 'EPERM' || e.code === 'ENOTEMPTY') {
-          if (attempt < 5) {
-            await new Promise(r => setTimeout(r, attempt * 1500)); // 1.5s, 3s, 4.5s, 6s
-          } else {
-            console.warn(`⚠️  [Tenant ${tid}] Session dir partially locked, skipping: ${e.message}`);
-          }
-        } else {
-          console.warn(`⚠️  [Tenant ${tid}] Could not delete session dir: ${e.message}`);
-          return;
-        }
-      }
-    }
-  }
-
-  async destroyAll() {
-    for (const [tid] of this.clients) {
-      await this.destroyClient(tid);
-    }
+    this.scheduledIntervals.clear();
+    this.configs.clear();
   }
 }
 
-const waManager = new TenantWAManager();
+const waManager = new CloudAPIManager();
 
 // ── Initialize All Active Tenants ───────────
 async function initAllTenants() {
@@ -606,12 +288,12 @@ async function initAllTenants() {
       console.log('ℹ️  No active tenants found. Create one via admin dashboard.');
       return;
     }
-    console.log(`🚀 Initializing ${tenants.length} tenant WA clients...`);
+    console.log(`🚀 Loading Cloud API configs for ${tenants.length} tenants...`);
     for (const tenant of tenants) {
       try {
-        await waManager.initClient(tenant.id);
+        await waManager.loadFromDB(tenant.id);
       } catch (err) {
-        console.error(`❌ Failed to init tenant ${tenant.id} (${tenant.name}):`, err.message);
+        console.error(`❌ Failed to load config for tenant ${tenant.id} (${tenant.name}):`, err.message);
       }
     }
   } catch (err) {
@@ -620,12 +302,137 @@ async function initAllTenants() {
 }
 
 // ══════════════════════════════════════════════
+// WEBHOOK - Receive Messages from WhatsApp Cloud API
+// ══════════════════════════════════════════════
+async function handleIncomingWebhook(entry) {
+  for (const change of (entry.changes || [])) {
+    if (change.field !== 'messages') continue;
+    const value = change.value;
+    if (!value) continue;
+
+    const phoneNumberId = value.metadata?.phone_number_id;
+    if (!phoneNumberId) continue;
+
+    // Find the tenant that owns this phone_number_id
+    let resolvedTenantId = waManager.findTenantByPhoneNumberId(phoneNumberId);
+    if (!resolvedTenantId) {
+      // Try loading from DB in case config was added recently
+      const { data: tenant } = await supabase.from('tenants')
+        .select('id').eq('wa_phone_number_id', phoneNumberId).eq('is_active', true).maybeSingle();
+      if (tenant) {
+        await waManager.loadFromDB(tenant.id);
+        resolvedTenantId = tenant.id;
+      } else {
+        console.warn(`⚠️  Webhook received for unknown phone_number_id: ${phoneNumberId}`);
+        continue;
+      }
+    }
+
+    // Handle incoming messages
+    const messages = value.messages || [];
+    const contacts = value.contacts || [];
+
+    for (const msg of messages) {
+      try {
+        const phone = cleanPhone(msg.from);
+        if (!phone) continue;
+
+        const msgId = msg.id;
+        if (isDuplicate(resolvedTenantId, msgId)) continue;
+
+        // Extract message text based on type
+        let body = '';
+        if (msg.type === 'text') {
+          body = msg.text?.body || '';
+        } else if (msg.type === 'image') {
+          body = msg.image?.caption || '[Image]';
+        } else if (msg.type === 'video') {
+          body = msg.video?.caption || '[Video]';
+        } else if (msg.type === 'audio') {
+          body = '[Audio]';
+        } else if (msg.type === 'document') {
+          body = msg.document?.caption || `[Document: ${msg.document?.filename || 'file'}]`;
+        } else if (msg.type === 'location') {
+          body = '[Location]';
+        } else if (msg.type === 'contacts') {
+          body = '[Contact]';
+        } else if (msg.type === 'sticker') {
+          body = '[Sticker]';
+        } else if (msg.type === 'reaction') {
+          continue; // Skip reactions
+        } else if (msg.type === 'interactive') {
+          body = msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || '[Interactive]';
+        } else {
+          body = `[${msg.type || 'Unknown'}]`;
+        }
+
+        console.log(`📩 [Tenant ${resolvedTenantId}] Incoming from ${phone}: ${body.substring(0, 50)}`);
+
+        // Save conversation
+        await supabase.from('conversations').insert({
+          tenant_id: resolvedTenantId, phone, message: body,
+          direction: 'incoming', status: 'received'
+        });
+
+        // Get contact name from webhook payload
+        const contactName = contacts.find(c => c.wa_id === msg.from)?.profile?.name || 'Unknown';
+
+        // Check if lead exists
+        const { data: existingLead } = await supabase.from('leads')
+          .select('id, phone').eq('tenant_id', resolvedTenantId).eq('phone', phone).maybeSingle();
+
+        const isNew = !existingLead;
+        if (!existingLead) {
+          let source = 'organic';
+          const lowerBody = body.toLowerCase();
+          if (lowerBody.includes('tips') || lowerBody.includes('ad')) source = 'meta_ads';
+
+          await supabase.from('leads').insert({
+            tenant_id: resolvedTenantId, phone, real_phone: phone,
+            name: contactName, source, status: 'new',
+            last_message_at: new Date().toISOString()
+          });
+
+          try {
+            await supabase.from('activity_log').insert({
+              tenant_id: resolvedTenantId, phone, action: 'lead_created',
+              details: `New lead from ${source}: ${contactName}`
+            });
+          } catch (_) {}
+        } else {
+          await supabase.from('leads').update({
+            last_message_at: new Date().toISOString(), real_phone: phone
+          }).eq('tenant_id', resolvedTenantId).eq('phone', phone);
+        }
+
+        // Check auto-replies
+        if (waManager.isReady(resolvedTenantId)) {
+          await waManager.checkAutoReply(resolvedTenantId, phone, body, isNew);
+        }
+      } catch (err) {
+        console.error(`❌ Webhook message processing error:`, err.message);
+      }
+    }
+
+    // Handle message status updates (sent, delivered, read, failed)
+    const statuses = value.statuses || [];
+    for (const status of statuses) {
+      try {
+        if (status.status === 'failed') {
+          console.warn(`⚠️  Message ${status.id} failed:`, status.errors?.[0]?.message);
+        }
+      } catch (_) {}
+    }
+  }
+}
+
+// ══════════════════════════════════════════════
 // EXPRESS APP
 // ══════════════════════════════════════════════
 const app = express();
 
-// Trust Render's reverse proxy for secure cookies & rate limiting
-if (IS_PRODUCTION) app.set('trust proxy', 1);
+// Trust the first proxy hop (required when running behind Render, nginx, etc.)
+app.set('trust proxy', 1);
 
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
 app.use(cors());
@@ -661,7 +468,6 @@ async function tenantAuth(req, res, next) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  // Verify tenant still exists and is active in DB
   const { data: tenant } = await supabase.from('tenants')
     .select('id, is_active').eq('id', decoded.tenant_id).maybeSingle();
   if (!tenant || !tenant.is_active) {
@@ -673,16 +479,15 @@ async function tenantAuth(req, res, next) {
   req.tenantName = decoded.name;
   req.tenantUsername = decoded.username;
 
-  // Refresh token on activity (sliding 30-min window)
   const now = Math.floor(Date.now() / 1000);
   const tokenAge = now - (decoded.iat || 0);
-  if (tokenAge > 300) { // Refresh if token is older than 5 min
+  if (tokenAge > 300) {
     const newToken = jwt.sign({
       tenant_id: decoded.tenant_id, username: decoded.username,
       name: decoded.name, role: 'tenant'
     }, JWT_SECRET, { expiresIn: '30m' });
     res.cookie('crm_token', newToken, {
-      httpOnly: true, secure: IS_PRODUCTION, sameSite: 'lax',
+      httpOnly: true, secure: false, sameSite: 'lax',
       maxAge: 30 * 60 * 1000
     });
   }
@@ -711,6 +516,41 @@ function anyAuth(req, res, next) {
 }
 
 // ══════════════════════════════════════════════
+// WEBHOOK ROUTES (must be before auth - no cookies)
+// ══════════════════════════════════════════════
+
+// Webhook verification (Meta sends GET to verify)
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode === 'subscribe' && token === WEBHOOK_VERIFY_TOKEN) {
+    console.log('✅ Webhook verified successfully');
+    return res.status(200).send(challenge);
+  }
+  console.warn('⚠️  Webhook verification failed');
+  res.sendStatus(403);
+});
+
+// Webhook for incoming messages
+app.post('/webhook', async (req, res) => {
+  // Always respond 200 quickly to avoid retries
+  res.sendStatus(200);
+
+  try {
+    const body = req.body;
+    if (body.object !== 'whatsapp_business_account') return;
+
+    for (const entry of (body.entry || [])) {
+      await handleIncomingWebhook(entry);
+    }
+  } catch (err) {
+    console.error('❌ Webhook processing error:', err.message);
+  }
+});
+
+// ══════════════════════════════════════════════
 // AUTH ROUTES
 // ══════════════════════════════════════════════
 app.post('/api/auth/login', loginLimiter, async (req, res) => {
@@ -736,7 +576,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
     }, JWT_SECRET, { expiresIn: '30m' });
 
     res.cookie('crm_token', token, {
-      httpOnly: true, secure: IS_PRODUCTION, sameSite: 'lax',
+      httpOnly: true, secure: false, sameSite: 'lax',
       maxAge: 30 * 60 * 1000
     });
 
@@ -764,7 +604,7 @@ app.post('/api/auth/admin-login', loginLimiter, async (req, res) => {
     const token = jwt.sign({ role: 'admin', username: ADMIN_USERNAME }, JWT_SECRET, { expiresIn: '24h' });
 
     res.cookie('crm_token', token, {
-      httpOnly: true, secure: IS_PRODUCTION, sameSite: 'lax',
+      httpOnly: true, secure: false, sameSite: 'lax',
       maxAge: 24 * 60 * 60 * 1000
     });
 
@@ -783,7 +623,6 @@ app.get('/api/auth/check', async (req, res) => {
   const decoded = verifyToken(req);
   if (!decoded) return res.status(401).json({ authenticated: false });
 
-  // For tenants, also verify they still exist in DB
   if (decoded.role === 'tenant') {
     const { data: tenant } = await supabase.from('tenants')
       .select('id, is_active').eq('id', decoded.tenant_id).maybeSingle();
@@ -810,13 +649,14 @@ app.get('/api/auth/check', async (req, res) => {
 app.get('/api/admin/tenants', adminAuth, async (req, res) => {
   try {
     const { data, error } = await supabase.from('tenants')
-      .select('id, username, unique_key, name, is_active, created_at, updated_at')
+      .select('id, username, unique_key, name, is_active, created_at, updated_at, wa_phone_number_id')
       .order('created_at', { ascending: false });
     if (error) throw error;
 
     const tenants = (data || []).map(t => ({
       ...t,
-      wa_status: waManager.getStatus(t.id)
+      wa_status: waManager.getStatus(t.id),
+      wa_configured: !!(t.wa_phone_number_id)
     }));
 
     res.json(tenants);
@@ -852,7 +692,7 @@ app.post('/api/admin/tenants', adminAuth, async (req, res) => {
     if (error) throw error;
 
     console.log(`✅ Tenant created: ${data.username} (ID: ${data.id})`);
-    res.json({ ...data, password_plain: String(password), wa_status: 'not_initialized' });
+    res.json({ ...data, password_plain: String(password), wa_status: 'not_configured' });
   } catch (err) {
     console.error('Create tenant error:', err.message);
     res.status(500).json({ error: 'Failed to create tenant' });
@@ -887,21 +727,12 @@ app.put('/api/admin/tenants/:id', adminAuth, async (req, res) => {
 app.delete('/api/admin/tenants/:id', adminAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
+    waManager.removeConfig(id);
 
-    // 1. Kill the in-memory WA client (RAM)
-    await waManager.destroyClient(id);
-
-    // 2. Wipe the disk session so the number can be re-linked fresh
-    await waManager.cleanupSessionFiles(id);
-
-    // 3. Cascade-delete all DB records for this tenant
-    //    (conversations, leads, quick_replies, auto_replies, broadcasts,
-    //     broadcast_recipients, scheduled_messages, activity_log, message_templates
-    //     are all ON DELETE CASCADE from the tenants FK)
     const { error } = await supabase.from('tenants').delete().eq('id', id);
     if (error) throw error;
 
-    console.log(`🗑️  Tenant ${id} fully purged (RAM + disk + database)`);
+    console.log(`🗑️  Tenant ${id} fully purged`);
     res.json({ success: true });
   } catch (err) {
     console.error('Delete tenant error:', err.message);
@@ -909,32 +740,66 @@ app.delete('/api/admin/tenants/:id', adminAuth, async (req, res) => {
   }
 });
 
-// ── Connect WhatsApp for Tenant ─────────────
-app.post('/api/admin/tenants/:id/connect-wa', adminAuth, async (req, res) => {
+// ── Configure WhatsApp Cloud API for Tenant ─
+app.post('/api/admin/tenants/:id/configure-wa', adminAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
+    const { phone_number_id, access_token, waba_id } = req.body;
+
+    if (!phone_number_id || !access_token) {
+      return res.status(400).json({ error: 'Phone Number ID and Access Token are required' });
+    }
+
     const { data: tenant } = await supabase.from('tenants')
       .select('id, name, is_active').eq('id', id).maybeSingle();
     if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
     if (!tenant.is_active) return res.status(400).json({ error: 'Tenant is deactivated' });
 
-    const existing = waManager.getState(id);
-    if (existing && existing.ready) {
-      return res.json({ success: true, status: 'already_connected' });
-    }
-
-    // If there's a stale/stuck client, destroy it first
-    if (existing && !existing.ready) {
-      await waManager.destroyClient(id);
-    }
-
-    waManager.initClient(id).catch(err => {
-      console.error(`❌ WA init error for tenant ${id}:`, err.message);
+    // Verify the credentials work by calling the Graph API
+    const testUrl = `https://graph.facebook.com/${GRAPH_API_VERSION}/${phone_number_id}`;
+    const testRes = await fetch(testUrl, {
+      headers: { 'Authorization': `Bearer ${access_token}` }
     });
+    const testData = await testRes.json();
+    if (!testRes.ok) {
+      return res.status(400).json({
+        error: `Invalid API credentials: ${testData.error?.message || 'Verification failed'}`
+      });
+    }
 
-    res.json({ success: true, status: 'initializing' });
+    await waManager.saveConfig(id, phone_number_id, access_token, waba_id || null);
+
+    console.log(`✅ [Tenant ${id}] Cloud API configured (Phone ID: ${phone_number_id})`);
+    res.json({
+      success: true, status: 'connected',
+      phone_display: testData.display_phone_number || phone_number_id,
+      verified_name: testData.verified_name || null
+    });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to connect WhatsApp' });
+    console.error(`❌ Configure WA error for tenant ${req.params.id}:`, err.message);
+    res.status(500).json({ error: err.message || 'Failed to configure WhatsApp' });
+  }
+});
+
+// ── Get WhatsApp Config for Tenant ──────────
+app.get('/api/admin/tenants/:id/wa-config', adminAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { data: tenant } = await supabase.from('tenants')
+      .select('wa_phone_number_id, wa_waba_id')
+      .eq('id', id).maybeSingle();
+
+    if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
+
+    res.json({
+      configured: !!(tenant.wa_phone_number_id),
+      phone_number_id: tenant.wa_phone_number_id || '',
+      waba_id: tenant.wa_waba_id || '',
+      has_token: !!(tenant.wa_phone_number_id),
+      status: waManager.getStatus(id)
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to get WA config' });
   }
 });
 
@@ -942,31 +807,11 @@ app.post('/api/admin/tenants/:id/connect-wa', adminAuth, async (req, res) => {
 app.post('/api/admin/tenants/:id/disconnect-wa', adminAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    // Only destroy the browser process — do NOT call client.logout() which wipes the session
-    // This preserves the saved session so reconnect works without QR
-    await waManager.destroyClient(id);
+    await waManager.saveConfig(id, null, null, null);
+    console.log(`🛑 [Tenant ${id}] Cloud API disconnected`);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to disconnect WhatsApp' });
-  }
-});
-
-// ── Get QR for Tenant ───────────────────────
-app.get('/api/admin/tenants/:id/qr', adminAuth, async (req, res) => {
-  try {
-    const id = parseInt(req.params.id);
-    const status = waManager.getStatus(id);
-    const qrData = waManager.getQR(id);
-
-    if (status === 'connected') return res.json({ ready: true, image: null, status });
-    if (!qrData) return res.json({ ready: false, image: null, status });
-
-    const dataUrl = await QRCode.toDataURL(qrData, {
-      width: 280, margin: 2, color: { dark: '#000000', light: '#ffffff' }
-    });
-    res.json({ ready: false, image: dataUrl, status });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to get QR' });
   }
 });
 
@@ -1006,43 +851,14 @@ app.get('/api/admin/tenants/:id/stats', adminAuth, async (req, res) => {
 });
 
 // ── Storage Stats (Admin) ───────────────────
-async function getDirSize(dirPath) {
-  let totalSize = 0;
-  try {
-    const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(dirPath, entry.name);
-      if (entry.isDirectory()) {
-        totalSize += await getDirSize(fullPath);
-      } else {
-        const stat = await fs.promises.stat(fullPath);
-        totalSize += stat.size;
-      }
-    }
-  } catch {}
-  return totalSize;
-}
-
-async function getTenantDiskUsage(tenantId) {
-  const sessionDir = path.join(__dirname, '.wwebjs_auth', `session-tenant_${tenantId}`);
-  return getDirSize(sessionDir);
-}
-
 app.get('/api/admin/storage', adminAuth, async (req, res) => {
   try {
-    const authDir = path.join(__dirname, '.wwebjs_auth');
-    const totalDisk = await getDirSize(authDir);
-
-    // RAM usage
     const memUsage = process.memoryUsage();
     const ramUsedMB = Math.round(memUsage.rss / 1024 / 1024);
     const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
     const heapTotalMB = Math.round(memUsage.heapTotal / 1024 / 1024);
+    const activeClients = waManager.configs.size;
 
-    // Active WA clients
-    const activeClients = waManager.clients.size;
-
-    // DB row counts
     const [convRes, leadsRes, broadcastRes, schedRes, activityRes, autoRes, qrRes, templateRes] = await Promise.all([
       supabase.from('conversations').select('id', { count: 'exact', head: true }),
       supabase.from('leads').select('id', { count: 'exact', head: true }),
@@ -1065,35 +881,22 @@ app.get('/api/admin/storage', adminAuth, async (req, res) => {
       message_templates: templateRes.count || 0,
     };
     const totalRows = Object.values(dbRows).reduce((a, b) => a + b, 0);
-
-    // Estimated DB size: ~0.5KB per row average
     const estimatedDbSizeMB = Math.round((totalRows * 512) / (1024 * 1024) * 100) / 100;
 
-    // Configurable limits (from env or auto-detect)
-    const diskLimitMB = parseInt(process.env.DISK_LIMIT_MB) || 1024;   // 1GB default
-    const ramLimitMB = parseInt(process.env.RAM_LIMIT_MB) || Math.round(os.totalmem() / (1024 * 1024)); // Auto-detect system RAM
-    const dbLimitMB = parseInt(process.env.DB_LIMIT_MB) || 500;        // 500MB Supabase free tier
+    const ramLimitMB = parseInt(process.env.RAM_LIMIT_MB) || Math.round(os.totalmem() / (1024 * 1024));
+    const dbLimitMB = parseInt(process.env.DB_LIMIT_MB) || 500;
 
     res.json({
-      disk: {
-        used_bytes: totalDisk,
-        used_mb: Math.round(totalDisk / (1024 * 1024) * 100) / 100,
-        limit_mb: diskLimitMB,
-        percent: Math.min(100, Math.round((totalDisk / (diskLimitMB * 1024 * 1024)) * 100)),
-      },
+      disk: { used_bytes: 0, used_mb: 0, limit_mb: 0, percent: 0 },
       ram: {
-        rss_mb: ramUsedMB,
-        heap_used_mb: heapUsedMB,
-        heap_total_mb: heapTotalMB,
+        rss_mb: ramUsedMB, heap_used_mb: heapUsedMB, heap_total_mb: heapTotalMB,
         limit_mb: ramLimitMB,
         percent: Math.min(100, Math.round((ramUsedMB / ramLimitMB) * 100)),
         active_clients: activeClients,
       },
       database: {
-        rows: dbRows,
-        total_rows: totalRows,
-        estimated_mb: estimatedDbSizeMB,
-        limit_mb: dbLimitMB,
+        rows: dbRows, total_rows: totalRows,
+        estimated_mb: estimatedDbSizeMB, limit_mb: dbLimitMB,
         percent: Math.min(100, Math.round((estimatedDbSizeMB / dbLimitMB) * 100)),
       },
       uptime_seconds: Math.floor(process.uptime()),
@@ -1111,8 +914,7 @@ app.get('/api/admin/storage/tenants', adminAuth, async (req, res) => {
     if (!allTenants) return res.json([]);
 
     const breakdown = await Promise.all(allTenants.map(async (t) => {
-      const [diskBytes, convRes, leadsRes, broadcastsRes] = await Promise.all([
-        getTenantDiskUsage(t.id),
+      const [convRes, leadsRes, broadcastsRes] = await Promise.all([
         supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('tenant_id', t.id),
         supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', t.id),
         supabase.from('broadcasts').select('id', { count: 'exact', head: true }).eq('tenant_id', t.id),
@@ -1123,24 +925,18 @@ app.get('/api/admin/storage/tenants', adminAuth, async (req, res) => {
       const broadcastsCount = broadcastsRes.count || 0;
       const totalRows = convCount + leadsCount + broadcastsCount;
       const waStatus = waManager.getStatus(t.id);
-      const isUsingRam = waManager.clients.has(String(t.id));
 
       return {
-        id: t.id,
-        name: t.name,
-        username: t.username,
-        disk_bytes: diskBytes,
-        disk_mb: Math.round(diskBytes / (1024 * 1024) * 100) / 100,
+        id: t.id, name: t.name, username: t.username,
+        disk_bytes: 0, disk_mb: 0,
         db_rows: { conversations: convCount, leads: leadsCount, broadcasts: broadcastsCount },
         total_rows: totalRows,
         estimated_db_mb: Math.round((totalRows * 512) / (1024 * 1024) * 100) / 100,
-        wa_status: waStatus,
-        using_ram: isUsingRam,
+        wa_status: waStatus, using_ram: false,
       };
     }));
 
-    // Sort by total usage descending
-    breakdown.sort((a, b) => (b.disk_bytes + b.total_rows) - (a.disk_bytes + a.total_rows));
+    breakdown.sort((a, b) => b.total_rows - a.total_rows);
     res.json(breakdown);
   } catch (err) {
     console.error('Tenant storage breakdown error:', err.message);
@@ -1166,33 +962,7 @@ app.post('/api/admin/storage/cleanup', adminAuth, async (req, res) => {
 
 // ── Cleanup Orphaned Session Folders ────────
 app.post('/api/admin/storage/cleanup-orphans', adminAuth, async (req, res) => {
-  try {
-    const authDir = path.join(__dirname, '.wwebjs_auth');
-    const { data: allTenants } = await supabase.from('tenants').select('id');
-    const validIds = new Set((allTenants || []).map(t => String(t.id)));
-
-    let cleaned = 0;
-    let freedBytes = 0;
-    try {
-      const entries = await fs.promises.readdir(authDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (!entry.isDirectory() || !entry.name.startsWith('session-tenant_')) continue;
-        const tid = entry.name.replace('session-tenant_', '');
-        if (!validIds.has(tid)) {
-          const dirPath = path.join(authDir, entry.name);
-          const size = await getDirSize(dirPath);
-          await fs.promises.rm(dirPath, { recursive: true, force: true });
-          freedBytes += size;
-          cleaned++;
-          console.log(`🧹 Removed orphaned session: ${entry.name} (${Math.round(size / 1024)}KB)`);
-        }
-      }
-    } catch {}
-    res.json({ cleaned, freed_bytes: freedBytes, freed_mb: Math.round(freedBytes / (1024 * 1024) * 100) / 100 });
-  } catch (err) {
-    console.error('Orphan cleanup error:', err.message);
-    res.status(500).json({ error: 'Failed to cleanup orphans' });
-  }
+  res.json({ cleaned: 0, freed_bytes: 0, freed_mb: 0 });
 });
 
 // ══════════════════════════════════════════════
@@ -1200,17 +970,7 @@ app.post('/api/admin/storage/cleanup-orphans', adminAuth, async (req, res) => {
 // ══════════════════════════════════════════════
 
 // ── Health / Status ─────────────────────────
-// Public health check (used by Render to verify the service is alive)
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    uptime: Math.floor(process.uptime()),
-    timestamp: new Date().toISOString()
-  });
-});
-
-// Tenant-specific health (requires auth)
-app.get('/api/tenant-health', tenantAuth, (req, res) => {
+app.get('/api/health', tenantAuth, (req, res) => {
   const status = waManager.getStatus(req.tenantId);
   res.json({
     status: 'ok', whatsapp: status,
@@ -1219,31 +979,10 @@ app.get('/api/tenant-health', tenantAuth, (req, res) => {
   });
 });
 
-app.get('/api/qr-status', tenantAuth, (req, res) => {
+app.get('/api/connection-status', tenantAuth, (req, res) => {
   const status = waManager.getStatus(req.tenantId);
-  const qr = waManager.getQR(req.tenantId);
-  res.json({
-    ready: status === 'connected',
-    qr,
-    banned: status === 'banned',
-    initializing: status === 'initializing',
-    status
-  });
-});
-
-app.get('/api/qr-image', tenantAuth, async (req, res) => {
-  const ready = waManager.isReady(req.tenantId);
-  if (ready) return res.json({ ready: true, image: null });
-  const qrData = waManager.getQR(req.tenantId);
-  if (!qrData) return res.json({ ready: false, image: null });
-  try {
-    const dataUrl = await QRCode.toDataURL(qrData, {
-      width: 280, margin: 2, color: { dark: '#000000', light: '#ffffff' }
-    });
-    res.json({ ready: false, image: dataUrl });
-  } catch (err) {
-    res.status(500).json({ error: 'QR generation failed' });
-  }
+  const ready = status === 'connected';
+  res.json({ ready, status });
 });
 
 // ── Send Reply ──────────────────────────────
@@ -1252,9 +991,8 @@ app.post('/api/send-reply', tenantAuth, sendLimiter, async (req, res) => {
     const { phone, message } = req.body;
     if (!phone || !message) return res.status(400).json({ error: 'Phone and message are required' });
 
-    const client = waManager.getClient(req.tenantId);
-    if (!client || !waManager.isReady(req.tenantId)) {
-      return res.status(503).json({ error: 'WhatsApp not connected' });
+    if (!waManager.isReady(req.tenantId)) {
+      return res.status(503).json({ error: 'WhatsApp Cloud API not configured. Contact admin.' });
     }
 
     const cleanedPhone = phone.replace(/\D/g, '');
@@ -1262,41 +1000,17 @@ app.post('/api/send-reply', tenantAuth, sendLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Invalid phone number format' });
     }
 
-    let chatId;
-    const { data: lead } = await supabase.from('leads')
-      .select('wa_jid').eq('tenant_id', req.tenantId).eq('phone', cleanedPhone).maybeSingle();
-
-    if (lead?.wa_jid) {
-      chatId = lead.wa_jid;
-    } else {
-      try {
-        const numberId = await client.getNumberId(cleanedPhone);
-        if (numberId) chatId = numberId._serialized;
-      } catch (_) {}
-      if (!chatId) chatId = cleanedPhone + '@c.us';
-    }
-
     await delay(MESSAGE_DELAY_MS);
-    if (!waManager.isReady(req.tenantId)) return res.status(503).json({ error: 'WhatsApp disconnected' });
+    await waManager.sendMessage(req.tenantId, cleanedPhone, message);
 
-    await client.sendMessage(chatId, message);
-
-    // Try to resolve real phone if not already set
-    const updateData = { last_message_at: new Date().toISOString() };
-    try {
-      const { data: leadCheck } = await supabase.from('leads')
-        .select('real_phone').eq('tenant_id', req.tenantId).eq('phone', cleanedPhone).maybeSingle();
-      if (leadCheck && !leadCheck.real_phone) {
-        const contact = await client.getContactById(chatId);
-        if (contact?.number) {
-          const num = contact.number.replace(/\D/g, '');
-          if (num) updateData.real_phone = num;
-        }
-      }
-    } catch (_) {}
+    // Store outgoing message
+    await supabase.from('conversations').insert({
+      tenant_id: req.tenantId, phone: cleanedPhone, message,
+      direction: 'outgoing', status: 'sent'
+    });
 
     await supabase.from('leads')
-      .update(updateData)
+      .update({ last_message_at: new Date().toISOString() })
       .eq('tenant_id', req.tenantId).eq('phone', cleanedPhone);
 
     res.json({ success: true, phone: cleanedPhone });
@@ -1412,33 +1126,8 @@ app.delete('/api/leads/:phone', tenantAuth, async (req, res) => {
 });
 
 app.post('/api/leads/:phone/resolve', tenantAuth, async (req, res) => {
-  try {
-    const client = waManager.getClient(req.tenantId);
-    if (!client || !waManager.isReady(req.tenantId)) {
-      return res.status(503).json({ error: 'WhatsApp not connected' });
-    }
-    const phone = req.params.phone.replace(/\D/g, '');
-    const { data: lead } = await supabase.from('leads')
-      .select('id, wa_jid, real_phone').eq('tenant_id', req.tenantId).eq('phone', phone).maybeSingle();
-    if (!lead) return res.status(404).json({ error: 'Lead not found' });
-
-    const jid = lead.wa_jid || phone + '@c.us';
-    let resolved = null;
-    try {
-      const contact = await client.getContactById(jid);
-      if (contact?.number) {
-        const num = contact.number.replace(/\D/g, '');
-        if (num) resolved = num;
-      }
-    } catch (e) {}
-
-    // Always save — fallback to JID phone if getContactById returned nothing
-    if (!resolved) resolved = phone;
-    await supabase.from('leads').update({ real_phone: resolved }).eq('id', lead.id);
-    res.json({ success: true, real_phone: resolved });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to resolve phone' });
-  }
+  const phone = req.params.phone.replace(/\D/g, '');
+  res.json({ success: true, real_phone: phone });
 });
 
 // ── Stats ───────────────────────────────────
@@ -1669,9 +1358,8 @@ app.post('/api/broadcasts', tenantAuth, async (req, res) => {
 
 app.post('/api/broadcasts/:id/send', tenantAuth, async (req, res) => {
   try {
-    const client = waManager.getClient(req.tenantId);
-    if (!client || !waManager.isReady(req.tenantId)) {
-      return res.status(503).json({ error: 'WhatsApp not connected' });
+    if (!waManager.isReady(req.tenantId)) {
+      return res.status(503).json({ error: 'WhatsApp Cloud API not configured' });
     }
 
     const id = parseInt(req.params.id);
@@ -1699,20 +1387,22 @@ async function sendBroadcastAsync(tenantId, broadcastId, message) {
     let sentCount = 0, failedCount = 0;
     for (const recipient of (recipients || [])) {
       try {
-        const client = waManager.getClient(tenantId);
-        if (!client || !waManager.isReady(tenantId)) {
+        if (!waManager.isReady(tenantId)) {
           await supabase.from('broadcast_recipients')
-            .update({ status: 'failed', error_message: 'WhatsApp disconnected' }).eq('id', recipient.id);
+            .update({ status: 'failed', error_message: 'WhatsApp not configured' }).eq('id', recipient.id);
           failedCount++; continue;
         }
 
         const cleanedPhone = recipient.phone.replace(/\D/g, '');
-        const { data: lead } = await supabase.from('leads').select('wa_jid')
-          .eq('tenant_id', tenantId).eq('phone', cleanedPhone).maybeSingle();
-        const chatId = lead?.wa_jid || cleanedPhone + '@c.us';
-
         await delay(MESSAGE_DELAY_MS + Math.random() * 2000);
-        await client.sendMessage(chatId, message);
+        await waManager.sendMessage(tenantId, cleanedPhone, message);
+
+        // Store outgoing message
+        await supabase.from('conversations').insert({
+          tenant_id: tenantId, phone: cleanedPhone, message,
+          direction: 'outgoing', status: 'sent'
+        });
+
         await supabase.from('broadcast_recipients')
           .update({ status: 'sent', sent_at: new Date().toISOString() }).eq('id', recipient.id);
         sentCount++;
@@ -1852,7 +1542,7 @@ app.get('/api/active-chats', tenantAuth, async (req, res) => {
           .eq('tenant_id', req.tenantId).eq('phone', lead.phone)
           .eq('direction', 'incoming').eq('status', 'received');
 
-        return { ...lead, real_phone: lead.real_phone || lead.phone, last_message: msgs?.[0] || null, unread_count: unreadRes.count || 0 };
+        return { ...lead, last_message: msgs?.[0] || null, unread_count: unreadRes.count || 0 };
       })
     );
 
@@ -1875,14 +1565,10 @@ app.get('/', (req, res) => {
 });
 
 app.get('/login', (req, res) => {
-  // Only redirect admins back to admin panel; never redirect tenants (they might be stuck on overlay)
   const decoded = verifyToken(req);
-  if (decoded && decoded.role === 'admin') {
-    return res.redirect('/admin');
-  }
-  // Clear tenant cookie so they can re-login
-  if (decoded && decoded.role === 'tenant') {
-    res.clearCookie('crm_token');
+  if (decoded) {
+    if (decoded.role === 'admin') return res.redirect('/admin');
+    return res.redirect('/crm');
   }
   res.sendFile(path.join(__dirname, 'public', 'login.html'));
 });
@@ -1897,7 +1583,6 @@ app.get('/crm', async (req, res) => {
   const decoded = verifyToken(req);
   if (!decoded || decoded.role !== 'tenant') return res.redirect('/login');
 
-  // Verify tenant still exists
   const { data: tenant } = await supabase.from('tenants')
     .select('id, is_active').eq('id', decoded.tenant_id).maybeSingle();
   if (!tenant || !tenant.is_active) {
@@ -1917,13 +1602,14 @@ app.get('*', (req, res) => {
 // ══════════════════════════════════════════════
 app.listen(PORT, () => {
   console.log('');
-  console.log('╔══════════════════════════════════════════════╗');
-  console.log('║   Billy777 WhatsApp CRM - Multi-Tenant        ║');
-  console.log('╠══════════════════════════════════════════════╣');
-  console.log(`║   🌐 Dashboard: http://localhost:${PORT}          ║`);
-  console.log(`║   👤 Admin:     ${ADMIN_USERNAME}                          ║`);
-  console.log('║   📡 API: /api/health                        ║');
-  console.log('╚══════════════════════════════════════════════╝');
+  console.log('╔══════════════════════════════════════════════════╗');
+  console.log('║   Billy777 WhatsApp CRM - Cloud API Edition      ║');
+  console.log('╠══════════════════════════════════════════════════╣');
+  console.log(`║   🌐 Dashboard:  http://localhost:${PORT}             ║`);
+  console.log(`║   👤 Admin:      ${ADMIN_USERNAME}                             ║`);
+  console.log(`║   📡 Webhook:    /webhook                         ║`);
+  console.log(`║   🔑 Verify:     ${WEBHOOK_VERIFY_TOKEN}               ║`);
+  console.log('╚══════════════════════════════════════════════════╝');
   console.log('');
 
   initAllTenants();
@@ -1932,17 +1618,6 @@ app.listen(PORT, () => {
 // ── Graceful Shutdown ───────────────────────
 process.on('SIGINT', async () => {
   console.log('\n🛑 Shutting down gracefully...');
-  await waManager.destroyAll();
+  waManager.destroyAll();
   process.exit(0);
-});
-
-process.on('unhandledRejection', (err) => {
-  // Suppress Windows file-lock errors from Chromium session cleanup
-  if (err && (err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'ENOTEMPTY')) return;
-  console.error('Unhandled rejection:', err.message);
-});
-
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught exception:', err.message);
-  // Don't exit — keep the server alive
 });

@@ -2,8 +2,6 @@
 // Billy777 WhatsApp CRM - Super Admin Dashboard
 // ============================================
 let tenants = [];
-let qrPollInterval = null;
-let qrPollTenantId = null;
 let pendingDeleteId = null;
 let lastCreatedCreds = null;
 let bulkCreatedCreds = [];
@@ -154,8 +152,9 @@ function renderTenantRows(list) {
         <td class="px-5 py-3.5">
           <div class="flex justify-end gap-1.5 flex-wrap">
             ${t.wa_status === 'connected'
-              ? `<button class="btn-sm btn-disconnect" onclick="disconnectWA(${t.id})">Disconnect</button>`
-              : `<button class="btn-sm btn-connect" onclick="connectWA(${t.id}, '${escapeHtml(t.name)}')">Connect WA</button>`
+              ? `<button class="btn-sm btn-edit" onclick="openWAConfigModal(${t.id}, '${escapeHtml(t.name)}')">⚙️ API Config</button>
+                 <button class="btn-sm btn-disconnect" onclick="disconnectWA(${t.id})">Disconnect</button>`
+              : `<button class="btn-sm btn-connect" onclick="openWAConfigModal(${t.id}, '${escapeHtml(t.name)}')">Configure API</button>`
             }
             <button class="btn-sm btn-edit" onclick="openEditModal(${t.id})">Edit</button>
             <button class="btn-sm btn-delete" onclick="openDeleteModal(${t.id}, '${escapeHtml(t.name)}')">Delete</button>
@@ -171,11 +170,8 @@ function renderTenantRows(list) {
 function getWABadge(status) {
   switch (status) {
     case 'connected': return '<span class="badge badge-connected"><span class="dot dot-green"></span> Connected</span>';
-    case 'waiting_qr': return '<span class="badge badge-qr"><span class="dot dot-yellow"></span> QR Ready</span>';
-    case 'initializing': return '<span class="badge badge-qr"><span class="dot dot-yellow"></span> Starting...</span>';
-    case 'disconnected': return '<span class="badge badge-disconnected"><span class="dot dot-red"></span> Disconnected</span>';
-    case 'banned': return '<span class="badge badge-disconnected">Banned</span>';
-    default: return '<span class="badge badge-init">Not Init</span>';
+    case 'not_configured':
+    default: return '<span class="badge badge-disconnected"><span class="dot dot-red"></span> Not Configured</span>';
   }
 }
 
@@ -410,74 +406,105 @@ function copyBulkCreds() {
   navigator.clipboard.writeText(text).then(() => toast('All credentials copied!', 'success'));
 }
 
-// ── WhatsApp Connect ────────────────────────
-async function connectWA(id, name) {
+// ── WhatsApp Cloud API Config ───────────────
+
+async function openWAConfigModal(id, name) {
+  document.getElementById('wa-config-title').textContent = `Configure WhatsApp - ${name}`;
+  document.getElementById('wac-tenant-id').value = id;
+  document.getElementById('wac-phone-id').value = '';
+  document.getElementById('wac-access-token').value = '';
+  document.getElementById('wac-waba-id').value = '';
+  document.getElementById('wa-config-error').classList.add('hidden');
+  const statusEl = document.getElementById('wa-config-status');
+  statusEl.classList.add('hidden');
+
+  // Load existing config
   try {
-    await api(`/api/admin/tenants/${id}/connect-wa`, { method: 'POST' });
-    openQrModal(id, name);
+    const config = await api(`/api/admin/tenants/${id}/wa-config`);
+    if (config.configured) {
+      document.getElementById('wac-phone-id').value = config.phone_number_id || '';
+      document.getElementById('wac-waba-id').value = config.waba_id || '';
+      statusEl.className = 'mb-4 p-3 rounded-xl text-xs';
+      statusEl.style.background = 'rgba(34,197,94,0.08)';
+      statusEl.style.border = '1px solid rgba(34,197,94,0.2)';
+      statusEl.innerHTML = '<span class="text-green-500 font-bold">✓ Currently configured</span> — Token is saved. Enter a new token to update.';
+      statusEl.classList.remove('hidden');
+      document.getElementById('wac-access-token').placeholder = '••••••• (saved — enter new to update)';
+      document.getElementById('wac-access-token').required = false;
+    } else {
+      document.getElementById('wac-access-token').placeholder = 'EAAxxxxxxx...';
+      document.getElementById('wac-access-token').required = true;
+    }
+  } catch (e) {
+    console.error('Load WA config error:', e);
+  }
+
+  document.getElementById('modal-wa-config').classList.remove('hidden');
+}
+
+async function saveWAConfig(e) {
+  e.preventDefault();
+  const id = document.getElementById('wac-tenant-id').value;
+  const phoneId = document.getElementById('wac-phone-id').value.trim();
+  const accessToken = document.getElementById('wac-access-token').value.trim();
+  const wabaId = document.getElementById('wac-waba-id').value.trim();
+  const errEl = document.getElementById('wa-config-error');
+  const btn = document.getElementById('wac-submit');
+
+  errEl.classList.add('hidden');
+
+  if (!phoneId) {
+    errEl.textContent = 'Phone Number ID is required';
+    errEl.classList.remove('hidden');
+    return;
+  }
+
+  btn.disabled = true;
+  btn.innerHTML = '<span class="inline-block w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin mr-1"></span> Verifying...';
+
+  try {
+    const body = { phone_number_id: phoneId, waba_id: wabaId };
+    if (accessToken) body.access_token = accessToken;
+
+    // If no new token but config exists, we need to inform user
+    if (!accessToken) {
+      const existing = await api(`/api/admin/tenants/${id}/wa-config`);
+      if (!existing.configured) {
+        errEl.textContent = 'Access Token is required for first-time setup';
+        errEl.classList.remove('hidden');
+        return;
+      }
+      // Keep existing token — just update phone_number_id/waba_id
+      // Re-read token from server by sending a flag
+      body.access_token = '__keep_existing__';
+    }
+
+    const result = await api(`/api/admin/tenants/${id}/configure-wa`, {
+      method: 'POST',
+      body: JSON.stringify(body)
+    });
+
+    toast(`WhatsApp configured! ${result.verified_name ? '(' + result.verified_name + ')' : ''}`, 'success');
+    closeModal('modal-wa-config');
     loadTenants();
   } catch (err) {
-    toast(err.message, 'error');
+    errEl.textContent = err.message;
+    errEl.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg> Save & Verify';
   }
 }
 
 async function disconnectWA(id) {
+  if (!confirm('Remove WhatsApp Cloud API config for this marketer?')) return;
   try {
     await api(`/api/admin/tenants/${id}/disconnect-wa`, { method: 'POST' });
-    toast('WhatsApp disconnected', 'success');
+    toast('WhatsApp API disconnected', 'success');
     loadTenants();
   } catch (err) {
     toast(err.message, 'error');
   }
-}
-
-function openQrModal(id, name) {
-  document.getElementById('qr-title').textContent = `Connect WhatsApp - ${name}`;
-  document.getElementById('qr-container').innerHTML = '<div class="dark:text-gray-500 text-gray-400 text-sm py-8"><div class="inline-block w-6 h-6 border-2 border-current border-t-transparent rounded-full animate-spin mb-2"></div><br>Starting WhatsApp engine...<br><span class="text-xs opacity-60">This may take 30–60 seconds on first connect</span></div>';
-  document.getElementById('modal-qr').classList.remove('hidden');
-
-  qrPollTenantId = id;
-  pollQR();
-  qrPollInterval = setInterval(pollQR, 2000);
-}
-
-async function pollQR() {
-  if (!qrPollTenantId) return;
-  try {
-    const data = await api(`/api/admin/tenants/${qrPollTenantId}/qr`);
-    const container = document.getElementById('qr-container');
-
-    if (data.ready) {
-      container.innerHTML = `
-        <div class="py-6">
-          <div class="w-16 h-16 rounded-full bg-green-500/15 flex items-center justify-center mx-auto mb-3">
-            <svg class="w-8 h-8 text-green-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg>
-          </div>
-          <p class="text-green-500 font-semibold">Connected Successfully!</p>
-          <p class="text-xs dark:text-gray-500 text-gray-400 mt-1">WhatsApp is now linked</p>
-        </div>
-      `;
-      clearInterval(qrPollInterval);
-      qrPollInterval = null;
-      loadTenants();
-    } else if (data.image) {
-      container.innerHTML = `<img src="${data.image}" alt="QR Code" class="mx-auto rounded-xl" style="width:260px;height:260px;">
-        <p class="text-[11px] dark:text-gray-500 text-gray-400 mt-3">Open WhatsApp &gt; Linked Devices &gt; Link a Device</p>`;
-    } else if (data.status === 'initializing') {
-      container.innerHTML = '<div class="dark:text-gray-500 text-gray-400 text-sm py-8"><div class="inline-block w-6 h-6 border-2 border-current border-t-transparent rounded-full animate-spin mb-2"></div><br>Starting WhatsApp engine...<br><span class="text-xs opacity-60">Launching browser, please wait...</span></div>';
-    } else {
-      container.innerHTML = '<div class="dark:text-gray-500 text-gray-400 text-sm py-8">Waiting for QR code...</div>';
-    }
-  } catch (err) {
-    console.error('QR poll error:', err);
-  }
-}
-
-function closeQrModal() {
-  clearInterval(qrPollInterval);
-  qrPollInterval = null;
-  qrPollTenantId = null;
-  closeModal('modal-qr');
 }
 
 // ── Delete ──────────────────────────────────
@@ -596,15 +623,9 @@ function renderTenantStorage(list) {
   }
 
   body.innerHTML = list.map(t => {
-    const waColor = t.wa_status === 'connected' ? 'text-green-500' :
-                    t.wa_status === 'waiting_qr' ? 'text-amber-500' : 'dark:text-gray-600 text-gray-400';
-    const waLabel = t.wa_status === 'connected' ? 'Connected' :
-                    t.wa_status === 'waiting_qr' ? 'QR Ready' :
-                    t.wa_status === 'banned' ? 'Banned' :
-                    t.wa_status === 'disconnected' ? 'Disconnected' : 'Not Init';
-    const ramBadge = t.using_ram
-      ? '<span class="inline-block px-1.5 py-0.5 rounded text-[9px] font-bold bg-blue-500/15 text-blue-500">~150 MB</span>'
-      : '<span class="text-[10px] dark:text-gray-600 text-gray-400">-</span>';
+    const waColor = t.wa_status === 'connected' ? 'text-green-500' : 'dark:text-gray-600 text-gray-400';
+    const waLabel = t.wa_status === 'connected' ? 'Connected' : 'Not Configured';
+    const ramBadge = '<span class="text-[10px] dark:text-gray-600 text-gray-400">-</span>';
 
     return `
       <tr class="border-b dark:border-white/[0.03] border-gray-100/80 text-xs">
