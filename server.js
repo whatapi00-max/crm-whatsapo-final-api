@@ -913,19 +913,21 @@ app.get('/api/admin/storage/tenants', adminAuth, async (req, res) => {
     const { data: allTenants } = await supabase.from('tenants').select('id, name, username');
     if (!allTenants) return res.json([]);
 
-    const breakdown = await Promise.all(allTenants.map(async (t) => {
-      const [convRes, leadsRes, broadcastsRes] = await Promise.all([
-        supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('tenant_id', t.id),
-        supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', t.id),
-        supabase.from('broadcasts').select('id', { count: 'exact', head: true }).eq('tenant_id', t.id),
-      ]);
+    // Fetch all counts in 3 bulk queries instead of 3 per tenant
+    const [convRes, leadsRes, broadcastsRes] = await Promise.all([
+      supabase.from('conversations').select('tenant_id', { count: 'exact' }).in('tenant_id', allTenants.map(t => t.id)),
+      supabase.from('leads').select('tenant_id', { count: 'exact' }).in('tenant_id', allTenants.map(t => t.id)),
+      supabase.from('broadcasts').select('tenant_id', { count: 'exact' }).in('tenant_id', allTenants.map(t => t.id)),
+    ]);
 
-      const convCount = convRes.count || 0;
-      const leadsCount = leadsRes.count || 0;
-      const broadcastsCount = broadcastsRes.count || 0;
+    const countBy = (rows, id) => (rows || []).filter(r => r.tenant_id === id).length;
+
+    const breakdown = allTenants.map((t) => {
+      const convCount = countBy(convRes.data, t.id);
+      const leadsCount = countBy(leadsRes.data, t.id);
+      const broadcastsCount = countBy(broadcastsRes.data, t.id);
       const totalRows = convCount + leadsCount + broadcastsCount;
       const waStatus = waManager.getStatus(t.id);
-
       return {
         id: t.id, name: t.name, username: t.username,
         disk_bytes: 0, disk_mb: 0,
@@ -934,7 +936,7 @@ app.get('/api/admin/storage/tenants', adminAuth, async (req, res) => {
         estimated_db_mb: Math.round((totalRows * 512) / (1024 * 1024) * 100) / 100,
         wa_status: waStatus, using_ram: false,
       };
-    }));
+    });
 
     breakdown.sort((a, b) => b.total_rows - a.total_rows);
     res.json(breakdown);
@@ -970,9 +972,10 @@ app.post('/api/admin/storage/cleanup-orphans', adminAuth, async (req, res) => {
 // ══════════════════════════════════════════════
 
 // ── Health / Status ─────────────────────────
-app.get('/api/health', (req, res) => {
+app.get('/api/health', tenantAuth, (req, res) => {
+  const status = waManager.getStatus(req.tenantId);
   res.json({
-    status: 'ok',
+    status: 'ok', whatsapp: status,
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString()
   });
