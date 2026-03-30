@@ -20,9 +20,10 @@
       }
     }
   </script>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="/style.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
 </head>
 <body class="dark:bg-dark-900 bg-gray-50 font-['Inter'] text-gray-800 dark:text-gray-100 h-screen overflow-hidden">
 
@@ -154,6 +155,7 @@
                 <!-- Status Filters -->
                 <div class="flex gap-1 overflow-x-auto scrollbar-hide">
                   <button class="filter-btn active" data-filter="all">All</button>
+                  <button class="filter-btn" data-filter="unread">Unread</button>
                   <button class="filter-btn" data-filter="new">New</button>
                   <button class="filter-btn" data-filter="contacted">Contacted</button>
                   <button class="filter-btn" data-filter="interested">Interested</button>
@@ -228,12 +230,29 @@
                       <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg>
                       <span class="hidden sm:inline">Send</span>
                     </button>
+                    <button id="voice-btn" class="p-2.5 rounded-xl hover:bg-white/5 text-gray-500 hover:text-wa-green transition-all flex-shrink-0" title="Record voice message">
+                      <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4M12 15a3 3 0 003-3V5a3 3 0 00-6 0v7a3 3 0 003 3z"/></svg>
+                    </button>
                   </div>
                   <div class="flex items-center justify-between mt-1.5 text-[10px] text-gray-600">
                     <span id="typing-indicator" class="hidden text-wa-green">
                       <span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span> typing...
                     </span>
                     <span id="char-count" class="ml-auto">0 / 4096</span>
+                  </div>
+                  <!-- Voice Recording Bar -->
+                  <div id="voice-recording-bar" class="hidden mt-2 flex items-center gap-3 p-2 rounded-xl bg-red-500/10 border border-red-500/20">
+                    <div class="w-3 h-3 rounded-full bg-red-500 animate-pulse"></div>
+                    <span class="text-xs text-red-400 font-medium" id="voice-timer">0:00</span>
+                    <div class="flex-1 h-1.5 rounded-full bg-red-500/20 overflow-hidden">
+                      <div id="voice-level" class="h-full bg-red-500 rounded-full transition-all" style="width: 0%"></div>
+                    </div>
+                    <button id="voice-cancel-btn" class="p-1.5 rounded-lg hover:bg-red-500/20 text-red-400" title="Cancel">
+                      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                    </button>
+                    <button id="voice-send-btn" class="px-3 py-1.5 bg-wa-green rounded-lg text-white text-xs font-medium hover:bg-wa-green/80" title="Send voice">
+                      <svg class="w-4 h-4 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg> Send
+                    </button>
                   </div>
                 </div>
               </div>
@@ -697,6 +716,16 @@
                     <span id="settings-conn-dot" class="w-3 h-3 rounded-full bg-red-500"></span>
                     <span class="text-sm" id="settings-conn-text">Disconnected</span>
                   </div>
+                  <select id="conn-status-select" class="text-xs bg-gray-100 dark:bg-dark-800 border border-gray-200 dark:border-white/10 rounded-lg px-2 py-1 outline-none">
+                    <option value="connected">Auto-detect</option>
+                    <option value="banned">Mark as Banned</option>
+                  </select>
+                </div>
+                <div id="ban-alert" class="hidden mb-3 p-3 rounded-xl bg-orange-500/10 border border-orange-500/20">
+                  <div class="flex items-center gap-2 text-orange-400 text-xs font-medium">
+                    <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"/></svg>
+                    <span id="ban-reason">Number appears to be banned</span>
+                  </div>
                 </div>
                 <p class="text-xs text-gray-500">WhatsApp connection is managed by your administrator. If disconnected, please contact admin.</p>
               </div>
@@ -745,6 +774,6 @@
     <source src="data:audio/wav;base64,UklGRl9vT19teleVkZXIAAAAAAAA" type="audio/wav">
   </audio>
 
-  <script src="script.js"></script>
+  <script src="/script.js"></script>
 </body>
 </html>

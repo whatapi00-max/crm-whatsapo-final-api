@@ -4,7 +4,20 @@
 // ============================================
 
 const API_BASE = '';
-const REFRESH_INTERVAL = 5000;
+const REFRESH_INTERVAL = 15000; // 15s instead of 5s — reduces server load 3x
+
+// ── Extract Tenant ID from URL (/crm/:tid) ──
+const TENANT_ID = (() => {
+  const m = window.location.pathname.match(/^\/crm\/(\d+)/);
+  return m ? m[1] : null;
+})();
+
+// Common headers for all API calls
+function tenantHeaders(extra = {}) {
+  const h = { ...extra };
+  if (TENANT_ID) h['X-Tenant-ID'] = TENANT_ID;
+  return h;
+}
 
 // ── State ──────────────────────────────────
 let activeChats = [];
@@ -19,6 +32,20 @@ let refreshTimer = null;
 let isInfoPanelOpen = false;
 let isSending = false;
 let currentSearch = '';
+let lastChatHash = ''; // Track if chat list actually changed
+let lastMsgCount = 0; // Track if messages changed
+let pageDataCache = {}; // Cache page data to avoid re-fetching on tab switch
+let lastRefreshTime = null; // For incremental updates
+let searchDebounceTimer = null;
+let messageCache = new Map(); // phone -> { messages: [], timestamp: number }
+const MSG_CACHE_TTL = 30000; // 30s cache per chat
+
+// ── Voice Recording State ──────────────────
+let mediaRecorder = null;
+let audioChunks = [];
+let voiceTimerInterval = null;
+let voiceStartTime = 0;
+let isRecording = false;
 
 // ── DOM Helpers ────────────────────────────
 const $ = (sel) => document.querySelector(sel);
@@ -26,9 +53,14 @@ const $$ = (sel) => document.querySelectorAll(sel);
 
 // ── Auth Check & Initialize ────────────────
 document.addEventListener('DOMContentLoaded', async () => {
+  // Redirect to login if no tenant ID in URL
+  if (!TENANT_ID) {
+    window.location.href = '/login';
+    return;
+  }
   // Check auth before anything
   try {
-    const res = await fetch('/api/auth/check');
+    const res = await fetch('/api/auth/check', { headers: tenantHeaders() });
     const data = await res.json();
     if (!data.authenticated || data.role !== 'tenant') {
       window.location.href = '/login';
@@ -45,7 +77,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   initNavigation();
   initEventListeners();
   checkConnection();
-  loadActiveChats();
+  loadActiveChats(true); // Full load on page init
   loadQuickReplies();
   startAutoRefresh();
   startSessionCheck();
@@ -56,7 +88,7 @@ function startSessionCheck() {
   // Check session validity every 60 seconds
   setInterval(async () => {
     try {
-      const res = await fetch('/api/auth/check');
+      const res = await fetch('/api/auth/check', { headers: tenantHeaders() });
       if (res.status === 401) {
         window.location.href = '/login';
       }
@@ -66,7 +98,7 @@ function startSessionCheck() {
 
 // ── Logout ─────────────────────────────────
 async function logoutTenant() {
-  try { await fetch('/api/auth/logout', { method: 'POST' }); } catch {}
+  try { await fetch(`/api/auth/logout?tid=${TENANT_ID}`, { method: 'POST', headers: tenantHeaders() }); } catch {}
   window.location.href = '/login';
 }
 
@@ -103,14 +135,29 @@ function navigateTo(page) {
   };
   $('#page-title').textContent = titles[page] || page;
 
-  // Load page data
+  // Load page data (with cache check for fast tab switching)
+  const cacheAge = pageDataCache[page] ? Date.now() - pageDataCache[page] : Infinity;
+  const CACHE_TTL = 30000; // 30s cache for page data
+
   switch (page) {
-    case 'contacts': loadContactsPage(); break;
-    case 'broadcasts': loadBroadcasts(); break;
-    case 'automation': loadAutoReplies(); break;
-    case 'analytics': loadAnalytics(); break;
-    case 'scheduled': loadScheduled(); break;
-    case 'quick-replies': loadQuickRepliesPage(); break;
+    case 'contacts': 
+      if (cacheAge > CACHE_TTL) { loadContactsPage(); pageDataCache[page] = Date.now(); }
+      break;
+    case 'broadcasts':
+      if (cacheAge > CACHE_TTL) { loadBroadcasts(); pageDataCache[page] = Date.now(); }
+      break;
+    case 'automation':
+      if (cacheAge > CACHE_TTL) { loadAutoReplies(); pageDataCache[page] = Date.now(); }
+      break;
+    case 'analytics':
+      if (cacheAge > CACHE_TTL) { loadAnalytics(); pageDataCache[page] = Date.now(); }
+      break;
+    case 'scheduled':
+      if (cacheAge > CACHE_TTL) { loadScheduled(); pageDataCache[page] = Date.now(); }
+      break;
+    case 'quick-replies':
+      if (cacheAge > CACHE_TTL) { loadQuickRepliesPage(); pageDataCache[page] = Date.now(); }
+      break;
     case 'settings': loadSettings(); break;
   }
 }
@@ -140,29 +187,39 @@ function initEventListeners() {
   // Theme toggle
   $('#theme-toggle').addEventListener('click', toggleTheme);
 
-  // Refresh button
+  // Refresh button — force full reload
   $('#refresh-btn').addEventListener('click', () => {
-    loadActiveChats();
-    if (currentPhone) loadChat(currentPhone);
+    lastRefreshTime = null; // Force full reload
+    lastChatHash = '';
+    lastMsgCount = 0;
+    pageDataCache = {}; // Clear page cache
+    messageCache.clear(); // Clear message cache
+    loadActiveChats(true);
+    if (currentPhone) loadChat(currentPhone, true);
     showToast('Data refreshed', 'info');
-    // Reload current page data
     navigateTo(currentPage);
   });
 
-  // Search in inbox
+  // Search in inbox (debounced)
   $('#search-input').addEventListener('input', (e) => {
-    currentSearch = e.target.value.toLowerCase().trim();
-    renderLeadsList();
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(() => {
+      currentSearch = e.target.value.toLowerCase().trim();
+      renderLeadsList();
+    }, 200);
   });
 
-  // Global search bar
+  // Global search bar (debounced)
   $('#global-search').addEventListener('input', (e) => {
-    const query = e.target.value.toLowerCase().trim();
-    if (currentPage === 'inbox') {
-      currentSearch = query;
-      $('#search-input').value = e.target.value;
-      renderLeadsList();
-    }
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(() => {
+      const query = e.target.value.toLowerCase().trim();
+      if (currentPage === 'inbox') {
+        currentSearch = query;
+        $('#search-input').value = e.target.value;
+        renderLeadsList();
+      }
+    }, 200);
   });
 
   // Filter buttons
@@ -222,8 +279,20 @@ function initEventListeners() {
   // Lead status change in chat header
   $('#chat-status-select').addEventListener('change', async (e) => {
     if (!currentPhone) return;
-    await updateLead(currentPhone, { status: e.target.value });
-    loadActiveChats();
+    const newStatus = e.target.value;
+
+    // Update local cache immediately for instant UI
+    const lead = activeChats.find(c => c.phone === currentPhone);
+    if (lead) lead.status = newStatus;
+    lastChatHash = ''; // Force re-render
+    renderLeadsList();
+
+    try {
+      await apiPut(`/api/leads/${encodeURIComponent(currentPhone)}`, { status: newStatus });
+    } catch (err) {
+      if (err.message && err.message.includes('401')) return;
+      console.error('Status update error:', err);
+    }
   });
 
   // Save lead details
@@ -282,6 +351,14 @@ function initEventListeners() {
   if (showQrBtn) showQrBtn.addEventListener('click', () => {
     $('#settings-qr').classList.toggle('hidden');
   });
+
+  // ── Voice Recording ──
+  const voiceBtn = $('#voice-btn');
+  if (voiceBtn) voiceBtn.addEventListener('click', startVoiceRecording);
+  const voiceCancelBtn = $('#voice-cancel-btn');
+  if (voiceCancelBtn) voiceCancelBtn.addEventListener('click', cancelVoiceRecording);
+  const voiceSendBtn = $('#voice-send-btn');
+  if (voiceSendBtn) voiceSendBtn.addEventListener('click', sendVoiceRecording);
 }
 
 // ══════════════════════════════════════════════
@@ -296,7 +373,7 @@ function handleAuthError(status) {
 }
 
 async function apiGet(path) {
-  const res = await fetch(API_BASE + path);
+  const res = await fetch(API_BASE + path, { headers: tenantHeaders() });
   if (handleAuthError(res.status)) throw new Error('401');
   if (!res.ok) throw new Error(`API error: ${res.status}`);
   return res.json();
@@ -305,7 +382,7 @@ async function apiGet(path) {
 async function apiPost(path, body) {
   const res = await fetch(API_BASE + path, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: tenantHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(body)
   });
   if (handleAuthError(res.status)) throw new Error('401');
@@ -319,16 +396,19 @@ async function apiPost(path, body) {
 async function apiPut(path, body) {
   const res = await fetch(API_BASE + path, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+    headers: tenantHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(body)
   });
   if (handleAuthError(res.status)) throw new Error('401');
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `API error: ${res.status}`);
+  }
   return res.json();
 }
 
 async function apiDelete(path) {
-  const res = await fetch(API_BASE + path, { method: 'DELETE' });
+  const res = await fetch(API_BASE + path, { method: 'DELETE', headers: tenantHeaders() });
   if (handleAuthError(res.status)) throw new Error('401');
   if (!res.ok) throw new Error(`API error: ${res.status}`);
   return res.json();
@@ -345,8 +425,22 @@ async function checkConnection() {
     const sDot = $('#settings-conn-dot');
     const sText = $('#settings-conn-text');
     const statusSel = $('#conn-status-select');
+    const banAlert = $('#ban-alert');
+    const banReason = $('#ban-reason');
 
-    if (data.ready) {
+    if (data.status === 'banned') {
+      dot.className = 'w-3 h-3 rounded-full bg-orange-500 block';
+      dot.style.animation = 'pulse-green 2s infinite';
+      text.textContent = 'Banned';
+      text.className = 'text-[11px] text-orange-500 opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap';
+      if (sDot) { sDot.className = 'w-3 h-3 rounded-full bg-orange-500'; }
+      if (sText) { sText.textContent = 'Number Banned / Restricted'; sText.className = 'text-sm text-orange-500 font-semibold'; }
+      if (statusSel) statusSel.value = 'banned';
+      if (banAlert) {
+        banAlert.classList.remove('hidden');
+        if (banReason) banReason.textContent = data.banned_reason || 'Number appears to be banned or restricted';
+      }
+    } else if (data.ready) {
       dot.className = 'w-3 h-3 rounded-full bg-wa-green block';
       dot.style.animation = 'pulse-green 2s infinite';
       text.textContent = 'Connected';
@@ -354,6 +448,7 @@ async function checkConnection() {
       if (sDot) { sDot.className = 'w-3 h-3 rounded-full bg-wa-green'; }
       if (sText) { sText.textContent = 'Connected via Cloud API'; sText.className = 'text-sm text-wa-green font-semibold'; }
       if (statusSel) statusSel.value = 'connected';
+      if (banAlert) banAlert.classList.add('hidden');
     } else {
       dot.className = 'w-3 h-3 rounded-full bg-red-500 block';
       dot.style.animation = '';
@@ -362,6 +457,7 @@ async function checkConnection() {
       if (sDot) { sDot.className = 'w-3 h-3 rounded-full bg-red-500'; }
       if (sText) { sText.textContent = 'Not Configured'; sText.className = 'text-sm text-red-400'; }
       if (statusSel) statusSel.value = 'connected';
+      if (banAlert) banAlert.classList.add('hidden');
     }
   } catch (err) {
     if (err.message && err.message.includes('401')) {
@@ -376,11 +472,37 @@ async function checkConnection() {
 // ══════════════════════════════════════════════
 // ACTIVE CHATS / LEADS LIST (Inbox)
 // ══════════════════════════════════════════════
-async function loadActiveChats() {
+async function loadActiveChats(force) {
   try {
-    activeChats = await apiGet('/api/active-chats');
+    let url = '/api/active-chats';
+    // Incremental updates: only fetch leads changed since last refresh
+    if (!force && lastRefreshTime) {
+      url += '?since=' + encodeURIComponent(lastRefreshTime);
+    }
+    const data = await apiGet(url);
+
+    if (!force && lastRefreshTime && data.length > 0) {
+      // Merge incremental updates into existing list
+      const phoneSet = new Set(data.map(d => d.phone));
+      activeChats = activeChats.filter(c => !phoneSet.has(c.phone)).concat(data);
+      activeChats.sort((a, b) => {
+        const ta = a.last_message_at || a.created_at || '';
+        const tb = b.last_message_at || b.created_at || '';
+        return tb.localeCompare(ta);
+      });
+    } else if (force || !lastRefreshTime) {
+      activeChats = data;
+    }
+
+    lastRefreshTime = new Date().toISOString();
     $('#chat-count').textContent = activeChats.length;
-    renderLeadsList();
+
+    // Only re-render if data actually changed (compare hash)
+    const newHash = activeChats.map(c => c.phone + (c.last_message_at || '') + (c.unread_count || 0) + c.status).join('|');
+    if (newHash !== lastChatHash) {
+      lastChatHash = newHash;
+      renderLeadsList();
+    }
   } catch (err) {
     console.error('Load chats error:', err);
   }
@@ -390,7 +512,9 @@ function renderLeadsList() {
   const container = $('#leads-list');
   let filtered = activeChats;
 
-  if (currentFilter !== 'all') {
+  if (currentFilter === 'unread') {
+    filtered = filtered.filter(c => (c.unread_count || 0) > 0);
+  } else if (currentFilter !== 'all') {
     filtered = filtered.filter(c => c.status === currentFilter);
   }
 
@@ -408,46 +532,95 @@ function renderLeadsList() {
     container.innerHTML = `
       <div class="p-8 text-center text-gray-600">
         <svg class="w-10 h-10 mx-auto mb-3 opacity-20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/></svg>
-        <p class="text-xs">No ${currentFilter === 'all' ? '' : currentFilter + ' '}leads found</p>
+        <p class="text-xs">No ${currentFilter === 'all' ? '' : currentFilter + ' '}chats found</p>
       </div>`;
     return;
   }
 
-  container.innerHTML = filtered.map(chat => {
-    const initials = getInitials(chat.name || chat.phone);
-    const avatarColor = getAvatarColor(chat.phone);
-    const lastMsg = chat.last_message;
-    const lastMsgText = lastMsg
-      ? (lastMsg.direction === 'outgoing' ? '↗ ' : '') + truncate(lastMsg.message, 40)
-      : 'No messages yet';
-    const timeStr = lastMsg ? formatTime(lastMsg.created_at) : '';
-    const isActive = chat.phone === currentPhone;
+  // Build a map of phones we need to show
+  const filteredPhones = new Set(filtered.map(c => c.phone));
+  const existingItems = new Map();
+  container.querySelectorAll('.lead-item').forEach(el => {
+    existingItems.set(el.dataset.phone, el);
+  });
 
-    const displayPhone = chat.real_phone ? '+' + chat.real_phone : '+' + chat.phone;
+  // Remove items not in filtered list
+  for (const [phone, el] of existingItems) {
+    if (!filteredPhones.has(phone)) el.remove();
+  }
 
-    return `
-      <div class="lead-item ${isActive ? 'active' : ''}" data-phone="${escapeAttr(chat.phone)}" onclick="selectChat('${escapeAttr(chat.phone)}')">
-        <div class="lead-avatar" style="background: ${avatarColor}">${escapeHtml(initials)}</div>
-        <div class="flex-1 min-w-0">
-          <div class="flex items-center justify-between">
-            <span class="font-medium text-sm truncate">${escapeHtml(chat.name || displayPhone)}</span>
-            <span class="text-[0.65rem] text-gray-500 ml-2 flex-shrink-0">${escapeHtml(timeStr)}</span>
-          </div>
-          <div class="flex items-center justify-between mt-0.5">
-            <p class="text-xs text-gray-500 truncate">${escapeHtml(displayPhone)} · ${escapeHtml(lastMsgText)}</p>
-            <div class="flex items-center gap-1 ml-2 flex-shrink-0">
-              ${chat.unread_count > 0 ? `<span class="unread-badge">${chat.unread_count}</span>` : ''}
-              <span class="status-badge status-${escapeAttr(chat.status)}">${escapeHtml(chat.status)}</span>
-            </div>
-          </div>
-        </div>
-      </div>`;
-  }).join('');
+  // Build/update items in order using a document fragment
+  const frag = document.createDocumentFragment();
+  for (const chat of filtered) {
+    const existing = existingItems.get(chat.phone);
+    if (existing) {
+      // Update in-place: only touch changed parts
+      updateLeadItem(existing, chat);
+      frag.appendChild(existing);
+    } else {
+      frag.appendChild(createLeadItem(chat));
+    }
+  }
+  container.innerHTML = '';
+  container.appendChild(frag);
 }
 
-function filterLeadsList(query) {
-  currentSearch = query;
-  renderLeadsList();
+function createLeadItem(chat) {
+  const div = document.createElement('div');
+  div.className = 'lead-item' + (chat.phone === currentPhone ? ' active' : '');
+  div.dataset.phone = chat.phone;
+  div.onclick = () => selectChat(chat.phone);
+  fillLeadItem(div, chat);
+  return div;
+}
+
+function fillLeadItem(div, chat) {
+  const initials = getInitials(chat.name || chat.phone);
+  const avatarColor = getAvatarColor(chat.phone);
+  const lastMsg = chat.last_message;
+  const lastMsgText = lastMsg
+    ? (lastMsg.direction === 'outgoing' ? '↗ ' : '') + truncate(lastMsg.message, 40)
+    : 'No messages yet';
+  const timeStr = lastMsg ? formatTime(lastMsg.created_at) : '';
+  const displayPhone = chat.real_phone ? '+' + chat.real_phone : '+' + chat.phone;
+
+  div.innerHTML = `
+    <div class="lead-avatar" style="background: ${avatarColor}">${escapeHtml(initials)}</div>
+    <div class="flex-1 min-w-0">
+      <div class="flex items-center justify-between">
+        <span class="font-medium text-sm truncate" data-field="name">${escapeHtml(chat.name || displayPhone)}</span>
+        <span class="text-[0.65rem] text-gray-500 ml-2 flex-shrink-0" data-field="time">${escapeHtml(timeStr)}</span>
+      </div>
+      <div class="flex items-center justify-between mt-0.5">
+        <p class="text-xs text-gray-500 truncate" data-field="preview">${escapeHtml(displayPhone)} · ${escapeHtml(lastMsgText)}</p>
+        <div class="flex items-center gap-1 ml-2 flex-shrink-0" data-field="badges">
+          ${chat.unread_count > 0 ? `<span class="unread-badge">${chat.unread_count}</span>` : ''}
+          <span class="status-badge status-${escapeAttr(chat.status)}">${escapeHtml(chat.status)}</span>
+        </div>
+      </div>
+    </div>`;
+}
+
+function updateLeadItem(div, chat) {
+  div.classList.toggle('active', chat.phone === currentPhone);
+  const lastMsg = chat.last_message;
+  const lastMsgText = lastMsg
+    ? (lastMsg.direction === 'outgoing' ? '↗ ' : '') + truncate(lastMsg.message, 40)
+    : 'No messages yet';
+  const timeStr = lastMsg ? formatTime(lastMsg.created_at) : '';
+  const displayPhone = chat.real_phone ? '+' + chat.real_phone : '+' + chat.phone;
+
+  const nameEl = div.querySelector('[data-field="name"]');
+  const timeEl = div.querySelector('[data-field="time"]');
+  const previewEl = div.querySelector('[data-field="preview"]');
+  const badgesEl = div.querySelector('[data-field="badges"]');
+
+  if (nameEl) nameEl.textContent = chat.name || displayPhone;
+  if (timeEl) timeEl.textContent = timeStr;
+  if (previewEl) previewEl.textContent = displayPhone + ' · ' + lastMsgText;
+  if (badgesEl) {
+    badgesEl.innerHTML = `${chat.unread_count > 0 ? `<span class="unread-badge">${chat.unread_count}</span>` : ''}<span class="status-badge status-${escapeAttr(chat.status)}">${escapeHtml(chat.status)}</span>`;
+  }
 }
 
 // ══════════════════════════════════════════════
@@ -478,7 +651,6 @@ async function selectChat(phone) {
     $('#info-phone').textContent = 'WA ID: ' + phone;
     const phoneVal = lead.real_phone || lead.phone || '';
     $('#info-real-phone').value = phoneVal ? (phoneVal.startsWith('+') ? phoneVal : '+' + phoneVal) : '';
-    // Auto-resolve if real_phone not yet set
     if (!lead.real_phone) setTimeout(() => resolvePhone(), 1000);
     $('#info-email').value = lead.email || '';
     $('#info-company').value = lead.company || '';
@@ -490,32 +662,64 @@ async function selectChat(phone) {
     $('#info-last-active').textContent = formatTime(lead.last_message_at);
   }
 
+  // Update active state without rebuilding entire list
   $$('.lead-item').forEach(el => {
     el.classList.toggle('active', el.dataset.phone === phone);
   });
 
-  $('#chat-messages').innerHTML = '<div class="text-center text-gray-500 py-8"><p class="text-sm">Loading messages...</p></div>';
+  // Immediately clear unread badge from local data and UI
+  const chatData = activeChats.find(c => c.phone === phone);
+  if (chatData && chatData.unread_count > 0) {
+    chatData.unread_count = 0;
+    const chatEl = document.querySelector(`.lead-item[data-phone="${phone}"]`);
+    if (chatEl) {
+      const badgesEl = chatEl.querySelector('[data-field="badges"]');
+      if (badgesEl) {
+        const unreadBadge = badgesEl.querySelector('.unread-badge');
+        if (unreadBadge) unreadBadge.remove();
+      }
+    }
+  }
 
-  await loadChat(phone);
+  // Show cached messages instantly if available
+  const cached = messageCache.get(phone);
+  if (cached) {
+    lastMsgCount = cached.messages.length;
+    renderMessages(cached.messages);
+  } else {
+    lastMsgCount = 0;
+    const chatMsgs = $('#chat-messages');
+    chatMsgs.innerHTML = '<div class="text-center text-gray-500 py-8"><p class="text-sm">Loading messages...</p></div>';
+  }
 
-  try {
-    await apiPost(`/api/messages/${encodeURIComponent(phone)}/read`, {});
-  } catch { /* ignore */ }
+  // Load fresh chat and mark as read in parallel
+  await Promise.all([
+    loadChat(phone, !cached), // force render if no cache
+    apiPost(`/api/messages/${encodeURIComponent(phone)}/read`, {}).catch(() => {})
+  ]);
 
   $('#message-input').focus();
 }
 
-async function loadChat(phone) {
+async function loadChat(phone, forceRender) {
   try {
     const messages = await apiGet(`/api/messages/${encodeURIComponent(phone)}`);
-    renderMessages(messages);
+    // Update cache
+    messageCache.set(phone, { messages, timestamp: Date.now() });
+    // Render if message count changed or forced
+    if (forceRender || messages.length !== lastMsgCount) {
+      lastMsgCount = messages.length;
+      if (currentPhone === phone) renderMessages(messages);
+    }
   } catch (err) {
     console.error('Load chat error:', err);
-    $('#chat-messages').innerHTML = `
-      <div class="text-center py-8">
-        <p class="text-sm text-red-400">Failed to load messages</p>
-        <button onclick="loadChat('${escapeAttr(phone)}')" class="mt-3 px-4 py-1.5 text-xs bg-white/10 rounded-lg hover:bg-white/20 transition-colors">Retry</button>
-      </div>`;
+    if (!messageCache.has(phone)) {
+      $('#chat-messages').innerHTML = `
+        <div class="text-center py-8">
+          <p class="text-sm text-red-400">Failed to load messages</p>
+          <button onclick="loadChat('${escapeAttr(phone)}', true)" class="mt-3 px-4 py-1.5 text-xs bg-white/10 rounded-lg hover:bg-white/20 transition-colors">Retry</button>
+        </div>`;
+    }
   }
 }
 
@@ -540,11 +744,48 @@ function renderMessages(messages) {
     const bubbleClass = isOutgoing ? 'msg-outgoing' : 'msg-incoming';
     const alignClass = isOutgoing ? 'flex justify-end' : 'flex justify-start';
 
+    // Check if this is a voice message
+    const isVoice = msg.message && (msg.message.includes('🎤') || msg.message === '[Audio]');
+    let contentHtml;
+    if (isVoice && msg.media_url) {
+      // Playable voice with audio proxy
+      const audioSrc = API_BASE + '/api/audio-proxy/' + msg.id;
+      contentHtml = `<div class="voice-msg-player" data-audio-src="${escapeAttr(audioSrc)}">
+        <div class="flex items-center gap-3 min-w-[200px]">
+          <button class="voice-play-btn w-9 h-9 flex items-center justify-center rounded-full bg-white/15 hover:bg-white/25 transition-colors flex-shrink-0" onclick="toggleVoicePlay(this)">
+            <svg class="w-5 h-5 play-icon" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+          </button>
+          <div class="flex-1 min-w-0">
+            <div class="voice-progress-wrap h-1.5 rounded-full bg-white/15 overflow-hidden cursor-pointer" onclick="seekVoice(event, this)">
+              <div class="voice-progress h-full rounded-full transition-all" style="width:0%; background: currentColor; opacity: 0.7"></div>
+            </div>
+          </div>
+          <span class="text-[10px] opacity-60 voice-duration flex-shrink-0">0:00</span>
+        </div>
+        <audio preload="none" data-src="${escapeAttr(audioSrc)}"></audio>
+      </div>`;
+    } else if (isVoice) {
+      // Voice message without audio data (old messages)
+      contentHtml = `<div class="voice-msg-player voice-no-audio">
+        <div class="flex items-center gap-3 min-w-[200px]">
+          <div class="w-9 h-9 flex items-center justify-center rounded-full bg-white/10 flex-shrink-0">
+            <svg class="w-5 h-5 opacity-50" fill="currentColor" viewBox="0 0 24 24"><path d="M12 15c1.66 0 3-1.34 3-3V6c0-1.66-1.34-3-3-3S9 4.34 9 6v6c0 1.66 1.34 3 3 3z"/><path d="M17 12c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V22h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+          </div>
+          <div class="flex-1">
+            <div class="h-1.5 rounded-full bg-white/10 overflow-hidden"><div class="h-full rounded-full bg-white/20" style="width:100%"></div></div>
+          </div>
+          <span class="text-[10px] opacity-40 flex-shrink-0">Voice</span>
+        </div>
+      </div>`;
+    } else {
+      contentHtml = `<div class="whitespace-pre-wrap">${escapeHtml(msg.message)}</div>`;
+    }
+
     return `
       ${dateSeparator}
       <div class="${alignClass}">
         <div class="msg-bubble ${bubbleClass}">
-          <div class="whitespace-pre-wrap">${escapeHtml(msg.message)}</div>
+          ${contentHtml}
           <div class="msg-time ${isOutgoing ? 'text-right' : ''}">${formatTime(msg.created_at)}${isOutgoing ? ' ✓✓' : ''}</div>
         </div>
       </div>`;
@@ -567,24 +808,345 @@ async function sendMessage() {
   sendBtn.disabled = true;
   sendBtn.innerHTML = '<svg class="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>';
 
+  // Clear input immediately for responsiveness
+  input.value = '';
+  input.style.height = 'auto';
+  $('#char-count').textContent = '0 / 4096';
+
+  // Optimistic UI: Add message bubble immediately without waiting for server
+  const container = $('#chat-messages');
+  const noMsgEl = container.querySelector('.text-center');
+  if (noMsgEl) container.innerHTML = '';
+  const now = new Date();
+  const tempBubble = document.createElement('div');
+  tempBubble.className = 'flex justify-end';
+  tempBubble.innerHTML = `<div class="msg-bubble msg-outgoing"><div class="whitespace-pre-wrap">${escapeHtml(message)}</div><div class="msg-time text-right">${now.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} ⏳</div></div>`;
+  container.appendChild(tempBubble);
+  container.scrollTop = container.scrollHeight;
+
   try {
     await apiPost('/api/send-reply', { phone: currentPhone, message });
-    input.value = '';
-    input.style.height = 'auto';
-    $('#char-count').textContent = '0 / 4096';
-    sendBtn.disabled = true;
-
-    $('#typing-indicator').classList.remove('hidden');
-    setTimeout(() => $('#typing-indicator').classList.add('hidden'), 1500);
-
-    await Promise.all([loadChat(currentPhone), loadActiveChats()]);
+    // Update the pending indicator to sent
+    const timeEl = tempBubble.querySelector('.msg-time');
+    if (timeEl) timeEl.textContent = timeEl.textContent.replace('⏳', '✓✓');
+    lastMsgCount++; // Track the new message
+    // Update message cache with the new message
+    const cached = messageCache.get(currentPhone);
+    if (cached) {
+      cached.messages.push({ message, direction: 'outgoing', status: 'sent', created_at: now.toISOString() });
+      cached.timestamp = Date.now();
+    }
     showToast('Message sent!', 'success');
+    // Refresh chat list in background (don't await)
+    loadActiveChats(true);
   } catch (err) {
+    // Mark as failed
+    tempBubble.querySelector('.msg-bubble').style.borderColor = 'rgba(239,68,68,0.4)';
+    const timeEl = tempBubble.querySelector('.msg-time');
+    if (timeEl) timeEl.textContent = timeEl.textContent.replace('⏳', '❌');
     showToast(err.message || 'Failed to send', 'error');
   } finally {
     isSending = false;
     sendBtn.disabled = false;
     sendBtn.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg><span class="hidden sm:inline">Send</span>';
+  }
+}
+
+// ══════════════════════════════════════════════
+// VOICE PLAYBACK (for received/sent voice messages)
+// ══════════════════════════════════════════════
+let currentlyPlayingAudio = null;
+
+async function toggleVoicePlay(btn) {
+  const player = btn.closest('.voice-msg-player');
+  const audio = player.querySelector('audio');
+  if (!audio) return;
+  const playIcon = player.querySelector('.play-icon');
+  const durationEl = player.querySelector('.voice-duration');
+  const progressEl = player.querySelector('.voice-progress');
+
+  // If already loading, ignore clicks
+  if (btn.dataset.loading === 'true') return;
+
+  // Lazy-load: fetch audio via authenticated request, create blob URL
+  if (!audio.src || audio.src === window.location.href) {
+    const audioUrl = audio.dataset.src || player.dataset.audioSrc;
+    if (!audioUrl) {
+      showToast('No audio source available', 'error');
+      return;
+    }
+    btn.dataset.loading = 'true';
+    durationEl.textContent = 'Loading...';
+    btn.classList.add('loading');
+    try {
+      const res = await fetch(audioUrl, { headers: tenantHeaders() });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || `HTTP ${res.status}`);
+      }
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      audio.src = blobUrl;
+      // Wait for audio to be ready
+      await new Promise((resolve, reject) => {
+        audio.onloadedmetadata = resolve;
+        audio.onerror = () => reject(new Error('Audio format not supported'));
+        audio.load();
+      });
+      if (audio.duration && isFinite(audio.duration)) {
+        const m = Math.floor(audio.duration / 60);
+        const s = Math.floor(audio.duration % 60);
+        durationEl.textContent = m + ':' + String(s).padStart(2, '0');
+      }
+    } catch (err) {
+      console.error('Audio load error:', err);
+      durationEl.textContent = 'Error';
+      btn.classList.remove('loading');
+      btn.dataset.loading = 'false';
+      showToast('Failed to load audio: ' + err.message, 'error');
+      return;
+    }
+    btn.classList.remove('loading');
+    btn.dataset.loading = 'false';
+  }
+
+  if (audio.paused || audio.ended) {
+    // Stop any other playing audio
+    if (currentlyPlayingAudio && currentlyPlayingAudio !== audio) {
+      currentlyPlayingAudio.pause();
+      currentlyPlayingAudio.currentTime = 0;
+      const otherPlayer = currentlyPlayingAudio.closest('.voice-msg-player');
+      if (otherPlayer) {
+        const otherBtn = otherPlayer.querySelector('.voice-play-btn');
+        if (otherBtn) otherBtn.classList.remove('playing');
+        otherPlayer.querySelector('.play-icon').innerHTML = '<path d="M8 5v14l11-7z"/>';
+        const otherProgress = otherPlayer.querySelector('.voice-progress');
+        if (otherProgress) otherProgress.style.width = '0%';
+      }
+    }
+
+    currentlyPlayingAudio = audio;
+    btn.classList.add('playing');
+    playIcon.innerHTML = '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>';
+
+    audio.ontimeupdate = () => {
+      if (audio.duration && isFinite(audio.duration)) {
+        const pct = (audio.currentTime / audio.duration) * 100;
+        if (progressEl) progressEl.style.width = pct + '%';
+        const remaining = audio.duration - audio.currentTime;
+        const m = Math.floor(remaining / 60);
+        const s = Math.floor(remaining % 60);
+        durationEl.textContent = m + ':' + String(s).padStart(2, '0');
+      }
+    };
+
+    audio.onended = () => {
+      btn.classList.remove('playing');
+      playIcon.innerHTML = '<path d="M8 5v14l11-7z"/>';
+      if (progressEl) progressEl.style.width = '0%';
+      currentlyPlayingAudio = null;
+      if (audio.duration && isFinite(audio.duration)) {
+        const m = Math.floor(audio.duration / 60);
+        const s = Math.floor(audio.duration % 60);
+        durationEl.textContent = m + ':' + String(s).padStart(2, '0');
+      }
+    };
+
+    audio.onerror = () => {
+      btn.classList.remove('playing');
+      playIcon.innerHTML = '<path d="M8 5v14l11-7z"/>';
+      durationEl.textContent = 'Error';
+      currentlyPlayingAudio = null;
+      showToast('Failed to play audio', 'error');
+    };
+
+    audio.play().catch(err => {
+      console.error('Audio play error:', err);
+      btn.classList.remove('playing');
+      playIcon.innerHTML = '<path d="M8 5v14l11-7z"/>';
+      durationEl.textContent = 'Error';
+      currentlyPlayingAudio = null;
+      showToast('Failed to play audio', 'error');
+    });
+  } else {
+    audio.pause();
+    btn.classList.remove('playing');
+    playIcon.innerHTML = '<path d="M8 5v14l11-7z"/>';
+  }
+}
+
+function seekVoice(event, progressWrap) {
+  const player = progressWrap.closest('.voice-msg-player');
+  const audio = player.querySelector('audio');
+  if (!audio.duration || !isFinite(audio.duration)) return;
+  const rect = progressWrap.getBoundingClientRect();
+  const pct = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+  audio.currentTime = pct * audio.duration;
+}
+
+// ══════════════════════════════════════════════
+// VOICE RECORDING
+// ══════════════════════════════════════════════
+async function startVoiceRecording() {
+  if (!currentPhone) {
+    showToast('Select a chat first', 'error');
+    return;
+  }
+  if (isRecording) return;
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioChunks = [];
+    isRecording = true;
+
+    // Use audio/webm for better browser support, server accepts any audio
+    const mimeType = MediaRecorder.isTypeSupported('audio/ogg; codecs=opus')
+      ? 'audio/ogg; codecs=opus'
+      : MediaRecorder.isTypeSupported('audio/webm; codecs=opus')
+        ? 'audio/webm; codecs=opus'
+        : 'audio/webm';
+
+    mediaRecorder = new MediaRecorder(stream, { mimeType });
+
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) audioChunks.push(e.data);
+    };
+
+    mediaRecorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+    };
+
+    mediaRecorder.start(250); // Collect data every 250ms
+
+    // Show recording UI
+    $('#voice-recording-bar').classList.remove('hidden');
+    $('#voice-btn').classList.add('text-red-500');
+    voiceStartTime = Date.now();
+    voiceTimerInterval = setInterval(updateVoiceTimer, 100);
+
+  } catch (err) {
+    console.error('Mic access error:', err);
+    showToast('Microphone access denied. Please allow microphone access.', 'error');
+  }
+}
+
+function updateVoiceTimer() {
+  const elapsed = Math.floor((Date.now() - voiceStartTime) / 1000);
+  const mins = Math.floor(elapsed / 60);
+  const secs = elapsed % 60;
+  const timerEl = $('#voice-timer');
+  if (timerEl) timerEl.textContent = `${mins}:${String(secs).padStart(2, '0')}`;
+
+  // Simple level animation
+  const levelEl = $('#voice-level');
+  if (levelEl) {
+    const width = 20 + Math.random() * 60;
+    levelEl.style.width = width + '%';
+  }
+
+  // Auto-stop after 2 minutes
+  if (elapsed >= 120) {
+    sendVoiceRecording();
+  }
+}
+
+function cancelVoiceRecording() {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop();
+  }
+  cleanupVoiceRecording();
+  showToast('Recording cancelled', 'info');
+}
+
+function cleanupVoiceRecording() {
+  isRecording = false;
+  audioChunks = [];
+  mediaRecorder = null;
+  if (voiceTimerInterval) {
+    clearInterval(voiceTimerInterval);
+    voiceTimerInterval = null;
+  }
+  $('#voice-recording-bar').classList.add('hidden');
+  $('#voice-btn').classList.remove('text-red-500');
+  const timerEl = $('#voice-timer');
+  if (timerEl) timerEl.textContent = '0:00';
+  const levelEl = $('#voice-level');
+  if (levelEl) levelEl.style.width = '0%';
+}
+
+async function sendVoiceRecording() {
+  if (!mediaRecorder || !currentPhone) return;
+  if (isSending) return;
+
+  // Stop recording and wait for final data
+  if (mediaRecorder.state !== 'inactive') {
+    await new Promise(resolve => {
+      mediaRecorder.onstop = () => {
+        mediaRecorder.stream.getTracks().forEach(t => t.stop());
+        resolve();
+      };
+      mediaRecorder.stop();
+    });
+  }
+
+  if (audioChunks.length === 0) {
+    cleanupVoiceRecording();
+    showToast('No audio recorded', 'error');
+    return;
+  }
+
+  isSending = true;
+  const sendBtn = $('#voice-send-btn');
+  if (sendBtn) sendBtn.disabled = true;
+
+  // Build audio blob
+  const mimeType = audioChunks[0]?.type || 'audio/ogg';
+  const audioBlob = new Blob(audioChunks, { type: mimeType });
+
+  cleanupVoiceRecording();
+
+  // Optimistic UI: Add voice bubble immediately
+  const container = $('#chat-messages');
+  const noMsgEl = container.querySelector('.text-center');
+  if (noMsgEl) container.innerHTML = '';
+  const now = new Date();
+  const tempBubble = document.createElement('div');
+  tempBubble.className = 'flex justify-end';
+  tempBubble.innerHTML = `<div class="msg-bubble msg-outgoing"><div class="flex items-center gap-2"><svg class="w-4 h-4 opacity-60" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4M12 15a3 3 0 003-3V5a3 3 0 00-6 0v7a3 3 0 003 3z"/></svg><span class="opacity-60">🎤 Voice message</span></div><div class="msg-time text-right">${now.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} ⏳</div></div>`;
+  container.appendChild(tempBubble);
+  container.scrollTop = container.scrollHeight;
+
+  try {
+    const formData = new FormData();
+    formData.append('phone', currentPhone);
+    formData.append('audio', audioBlob, 'voice.ogg');
+
+    const res = await fetch(API_BASE + '/api/send-voice', {
+      method: 'POST',
+      headers: tenantHeaders(), // Don't set Content-Type, let browser set multipart boundary
+      body: formData
+    });
+
+    if (handleAuthError(res.status)) throw new Error('401');
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `API error: ${res.status}`);
+    }
+
+    const timeEl = tempBubble.querySelector('.msg-time');
+    if (timeEl) timeEl.textContent = timeEl.textContent.replace('⏳', '✓✓');
+    showToast('Voice message sent!', 'success');
+    // Reload messages from DB so play button appears with real media_url
+    await loadChat(currentPhone, true);
+    loadActiveChats(true);
+  } catch (err) {
+    tempBubble.querySelector('.msg-bubble').style.borderColor = 'rgba(239,68,68,0.4)';
+    const timeEl = tempBubble.querySelector('.msg-time');
+    if (timeEl) timeEl.textContent = timeEl.textContent.replace('⏳', '❌');
+    showToast(err.message || 'Failed to send voice message', 'error');
+  } finally {
+    isSending = false;
+    if (sendBtn) sendBtn.disabled = false;
   }
 }
 
@@ -623,8 +1185,12 @@ function useQuickReply(id) {
 async function updateLead(phone, data) {
   try {
     await apiPut(`/api/leads/${encodeURIComponent(phone)}`, data);
+    // Update local cache
+    const lead = activeChats.find(c => c.phone === phone);
+    if (lead) Object.assign(lead, data);
     showToast('Lead updated', 'success');
   } catch (err) {
+    if (err.message && err.message.includes('401')) return;
     showToast('Update failed', 'error');
   }
 }
@@ -639,18 +1205,24 @@ async function saveLeadDetails() {
   const tagsStr = $('#info-tags').value;
   const tags = tagsStr ? tagsStr.split(',').map(t => t.trim()).filter(Boolean) : [];
 
-  await updateLead(currentPhone, {
+  const updates = {
     name: $('#info-name').value,
     real_phone: $('#info-real-phone').value.trim(),
     email: $('#info-email').value.trim(),
     company: $('#info-company').value.trim(),
     source: $('#info-source').value,
     notes: $('#info-notes').value,
-
     tags
-  });
+  };
 
-  loadActiveChats();
+  await updateLead(currentPhone, updates);
+  // Re-render chat header name if it changed
+  const lead = activeChats.find(c => c.phone === currentPhone);
+  if (lead && lead.name) {
+    $('#chat-name').textContent = lead.name;
+  }
+  lastChatHash = '';
+  renderLeadsList();
 }
 
 async function resolvePhone() {
@@ -698,7 +1270,9 @@ async function deleteLead() {
 // ══════════════════════════════════════════════
 async function loadContactsPage() {
   try {
-    const chats = activeChats.length ? activeChats : await apiGet('/api/active-chats');
+    // Always use cached activeChats — no extra API call
+    if (!activeChats.length) await loadActiveChats(true);
+    const chats = activeChats;
     const stats = { total: 0, new: 0, contacted: 0, interested: 0 };
 
     chats.forEach(c => {
@@ -821,6 +1395,7 @@ function renderBroadcasts() {
         </div>
         <div class="flex gap-2">
           ${bc.status === 'draft' ? `<button class="btn-primary text-xs py-1.5 px-3" onclick="sendBroadcast('${bc.id}')">Send Now</button>` : ''}
+          ${bc.status === 'sending' ? `<button class="text-xs px-3 py-1.5 rounded-lg text-amber-400 hover:bg-amber-500/10 border border-amber-500/20 font-medium" onclick="cancelBroadcast('${bc.id}')">Cancel</button>` : ''}
           <button class="text-xs px-3 py-1.5 rounded-lg text-red-400 hover:bg-red-500/10 border border-red-500/15" onclick="deleteBroadcast('${bc.id}')">Delete</button>
         </div>
       </div>
@@ -850,11 +1425,35 @@ async function createBroadcast() {
 async function sendBroadcast(id) {
   if (!confirm('Send this broadcast to all recipients now?')) return;
   try {
-    await apiPost(`/api/broadcasts/${id}/send`, {});
-    showToast('Broadcast sending started!', 'success');
-    loadBroadcasts();
+    const result = await apiPost(`/api/broadcasts/${id}/send`, {});
+    showToast('Broadcast sending started in background!', 'success');
+    // Poll broadcast status periodically
+    const pollInterval = setInterval(async () => {
+      try {
+        const updated = await apiGet('/api/broadcasts');
+        broadcasts = updated;
+        renderBroadcasts();
+        const bc = updated.find(b => String(b.id) === String(id));
+        if (bc && (bc.status === 'completed' || bc.status === 'failed' || bc.status === 'cancelled')) {
+          clearInterval(pollInterval);
+          const bcType = bc.status === 'completed' ? 'success' : bc.status === 'cancelled' ? 'info' : 'error';
+          showToast(`Broadcast ${bc.status}: ${bc.sent_count || 0} sent, ${bc.failed_count || 0} failed`, bcType);
+        }
+      } catch { clearInterval(pollInterval); }
+    }, 5000);
   } catch (err) {
     showToast(err.message || 'Failed to send', 'error');
+  }
+}
+
+async function cancelBroadcast(id) {
+  if (!confirm('Cancel this broadcast? Messages already sent cannot be undone.')) return;
+  try {
+    await apiPost(`/api/broadcasts/${id}/cancel`, {});
+    showToast('Broadcast cancelling...', 'info');
+    loadBroadcasts();
+  } catch (err) {
+    showToast(err.message || 'Failed to cancel', 'error');
   }
 }
 
@@ -1093,7 +1692,7 @@ async function deleteScheduled(id) {
   if (!confirm('Cancel this scheduled message?')) return;
   try {
     await apiDelete(`/api/scheduled/${id}`);
-    showToast('Cancelled', 'success');
+    showToast('Scheduled message cancelled', 'success');
     loadScheduled();
   } catch {
     showToast('Delete failed', 'error');
@@ -1169,7 +1768,7 @@ async function deleteQR(id) {
   if (!confirm('Delete this quick reply?')) return;
   try {
     await apiDelete(`/api/quick-replies/${id}`);
-    showToast('Deleted', 'success');
+    showToast('Quick reply deleted', 'success');
     loadQuickRepliesPage();
     loadQuickReplies();
   } catch {
@@ -1201,11 +1800,20 @@ function loadSettings() {
 // ══════════════════════════════════════════════
 function startAutoRefresh() {
   refreshTimer = setInterval(async () => {
-    await checkConnection();
-    await loadActiveChats();
+    // Only refresh if tab is visible (don't waste resources on hidden tabs)
+    if (document.hidden) return;
+    
+    // Run connection check and chat list refresh in parallel
+    const promises = [checkConnection(), loadActiveChats()];
+    // Only refresh current chat if on inbox page AND cache is stale
     if (currentPhone && currentPage === 'inbox') {
-      await loadChat(currentPhone);
+      const cached = messageCache.get(currentPhone);
+      const isStale = !cached || (Date.now() - cached.timestamp) > MSG_CACHE_TTL;
+      if (isStale) {
+        promises.push(loadChat(currentPhone));
+      }
     }
+    await Promise.all(promises);
   }, REFRESH_INTERVAL);
 }
 
@@ -1214,14 +1822,16 @@ function startAutoRefresh() {
 // ══════════════════════════════════════════════
 function showToast(message, type = 'info') {
   const container = $('#toast-container');
+  // Limit to 5 stacked toasts — remove oldest if over
+  const existing = container.querySelectorAll('.toast');
+  if (existing.length >= 5) existing[0].remove();
   const toast = document.createElement('div');
   toast.className = `toast toast-${type}`;
   toast.textContent = message;
   container.appendChild(toast);
   setTimeout(() => {
-    toast.style.opacity = '0';
-    toast.style.transform = 'translateX(100%)';
-    toast.style.transition = 'all 0.3s ease';
+    // Use CSS class so transition fires properly (not same-frame style set)
+    toast.classList.add('hiding');
     setTimeout(() => toast.remove(), 300);
   }, 3000);
 }
@@ -1291,11 +1901,11 @@ function formatNumber(num) {
   return parseFloat(num || 0).toFixed(2);
 }
 
+// Fast escapeHtml without DOM creation (10x faster)
+const _escapeMap = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 function escapeHtml(str) {
   if (!str) return '';
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+  return String(str).replace(/[&<>"']/g, c => _escapeMap[c]);
 }
 
 function escapeAttr(str) {

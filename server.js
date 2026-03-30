@@ -5,17 +5,20 @@
 require('dotenv').config();
 
 const express = require('express');
-const cors = require('cors');
 const helmet = require('helmet');
+const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const cookieParser = require('cookie-parser');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { createClient } = require('@supabase/supabase-js');
+const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const fs = require('fs');
+const ffmpegPath = require('ffmpeg-static');
+const { execFile } = require('child_process');
 
 // ── Config ──────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -88,8 +91,28 @@ class CloudAPIManager {
   getStatus(tenantId) {
     const cfg = this.getConfig(tenantId);
     if (!cfg) return 'not_configured';
+    if (cfg.banned) return 'banned';
     if (cfg.phone_number_id && cfg.access_token) return 'connected';
     return 'not_configured';
+  }
+
+  markBanned(tenantId, reason) {
+    const cfg = this.getConfig(tenantId);
+    if (cfg) {
+      cfg.banned = true;
+      cfg.banned_reason = reason || 'Unknown';
+      cfg.banned_at = new Date().toISOString();
+      console.error(`🚫 [Tenant ${tenantId}] WhatsApp number BANNED: ${reason}`);
+    }
+  }
+
+  clearBan(tenantId) {
+    const cfg = this.getConfig(tenantId);
+    if (cfg) {
+      delete cfg.banned;
+      delete cfg.banned_reason;
+      delete cfg.banned_at;
+    }
   }
 
   async loadFromDB(tenantId) {
@@ -179,7 +202,169 @@ class CloudAPIManager {
 
     const data = await response.json();
     if (!response.ok) {
+      const errCode = data.error?.code;
       const errMsg = data.error?.message || data.error?.error_data?.details || JSON.stringify(data.error) || 'Cloud API error';
+      // Check for ban-related errors
+      if (errCode === 131031 || errCode === 368 || errCode === 131026) {
+        this.markBanned(tenantId, `Error ${errCode}: ${errMsg}`);
+      }
+      throw new Error(errMsg);
+    }
+    return data;
+  }
+
+  // ── Download Media from WhatsApp ───────────
+  async downloadMediaUrl(tenantId, mediaId) {
+    const cfg = this.getConfig(tenantId);
+    if (!cfg || !cfg.access_token) throw new Error('Not configured');
+
+    // Step 1: Get the media URL from WhatsApp
+    const metaRes = await fetch(`https://graph.facebook.com/${GRAPH_API_VERSION}/${mediaId}`, {
+      headers: { 'Authorization': `Bearer ${cfg.access_token}` }
+    });
+    const metaData = await metaRes.json();
+    if (!metaRes.ok || !metaData.url) {
+      console.error('Media URL fetch failed:', metaData);
+      return null;
+    }
+    return metaData.url;
+  }
+
+  // ── Send Audio Message via Cloud API ───────
+  async sendAudioMessage(tenantId, to, audioUrl) {
+    const cfg = this.getConfig(tenantId);
+    if (!cfg || !cfg.phone_number_id || !cfg.access_token) {
+      throw new Error('WhatsApp Cloud API not configured for this tenant');
+    }
+
+    const cleanedTo = String(to).replace(/\D/g, '');
+    const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${cfg.phone_number_id}/messages`;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${cfg.access_token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: cleanedTo,
+        type: 'audio',
+        audio: { link: audioUrl }
+      })
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      const errCode = data.error?.code;
+      const errMsg = data.error?.message || data.error?.error_data?.details || JSON.stringify(data.error) || 'Cloud API error';
+      // Check for ban-related errors
+      if (errCode === 131031 || errCode === 368 || errCode === 131026) {
+        this.markBanned(tenantId, `Error ${errCode}: ${errMsg}`);
+      }
+      throw new Error(errMsg);
+    }
+    return data;
+  }
+
+  // ── Upload Media to WhatsApp ───────────────
+  async uploadMedia(tenantId, audioBuffer, mimeType) {
+    const cfg = this.getConfig(tenantId);
+    if (!cfg || !cfg.phone_number_id || !cfg.access_token) {
+      throw new Error('WhatsApp Cloud API not configured for this tenant');
+    }
+
+    const cleanMime = mimeType.split(';')[0].trim();
+    const whatsappAudioTypes = ['audio/aac', 'audio/mp4', 'audio/mpeg', 'audio/amr', 'audio/ogg', 'audio/opus'];
+
+    let finalBuffer = audioBuffer;
+    let finalMime = cleanMime;
+
+    // Convert unsupported formats (like audio/webm) to audio/ogg
+    if (!whatsappAudioTypes.includes(cleanMime)) {
+      console.log(`🎙️ Converting ${cleanMime} to audio/ogg using ffmpeg...`);
+      const tmpDir = os.tmpdir();
+      const inputPath = path.join(tmpDir, `wa_input_${Date.now()}.webm`);
+      const outputPath = path.join(tmpDir, `wa_output_${Date.now()}.ogg`);
+      try {
+        fs.writeFileSync(inputPath, audioBuffer);
+        await new Promise((resolve, reject) => {
+          execFile(ffmpegPath, [
+            '-i', inputPath,
+            '-c:a', 'libopus',
+            '-b:a', '64k',
+            '-y',
+            outputPath
+          ], { timeout: 30000 }, (err, stdout, stderr) => {
+            if (err) reject(new Error(`FFmpeg conversion failed: ${err.message}`));
+            else resolve();
+          });
+        });
+        finalBuffer = fs.readFileSync(outputPath);
+        finalMime = 'audio/ogg';
+        console.log(`🎙️ Converted: ${audioBuffer.length} bytes -> ${finalBuffer.length} bytes (ogg)`);
+      } finally {
+        try { fs.unlinkSync(inputPath); } catch {}
+        try { fs.unlinkSync(outputPath); } catch {}
+      }
+    }
+
+    const blob = new Blob([finalBuffer], { type: finalMime });
+    const formData = new FormData();
+    formData.append('messaging_product', 'whatsapp');
+    formData.append('type', finalMime);
+    formData.append('file', blob, finalMime === 'audio/ogg' ? 'voice.ogg' : 'voice.mp4');
+
+    const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${cfg.phone_number_id}/media`;
+    console.log(`🎙️ Uploading media: ${finalMime}, ${finalBuffer.length} bytes`);
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${cfg.access_token}` },
+      body: formData
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      console.error('Media upload failed:', data);
+      throw new Error(data.error?.message || 'Media upload failed');
+    }
+    console.log(`🎙️ Media uploaded, ID: ${data.id}`);
+    return data.id;
+  }
+
+  // ── Send Audio by Media ID ────────────────
+  async sendAudioById(tenantId, to, mediaId) {
+    const cfg = this.getConfig(tenantId);
+    if (!cfg || !cfg.phone_number_id || !cfg.access_token) {
+      throw new Error('WhatsApp Cloud API not configured for this tenant');
+    }
+
+    const cleanedTo = String(to).replace(/\D/g, '');
+    const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${cfg.phone_number_id}/messages`;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${cfg.access_token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: cleanedTo,
+        type: 'audio',
+        audio: { id: mediaId }
+      })
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      const errCode = data.error?.code;
+      const errMsg = data.error?.message || data.error?.error_data?.details || JSON.stringify(data.error) || 'Cloud API error';
+      if (errCode === 131031 || errCode === 368 || errCode === 131026) {
+        this.markBanned(tenantId, `Error ${errCode}: ${errMsg}`);
+      }
       throw new Error(errMsg);
     }
     return data;
@@ -342,14 +527,17 @@ async function handleIncomingWebhook(entry) {
 
         // Extract message text based on type
         let body = '';
+        let incomingMediaId = null;
         if (msg.type === 'text') {
           body = msg.text?.body || '';
         } else if (msg.type === 'image') {
           body = msg.image?.caption || '[Image]';
         } else if (msg.type === 'video') {
           body = msg.video?.caption || '[Video]';
-        } else if (msg.type === 'audio') {
-          body = '[Audio]';
+        } else if (msg.type === 'audio' || msg.type === 'ptt') {
+          body = '🎤 Voice message';
+          incomingMediaId = (msg.audio?.id || msg.ptt?.id) || null;
+          console.log(`🎙️ AUDIO/PTT RECEIVED from ${phone}: type=${msg.type}, media_id=${incomingMediaId}`);
         } else if (msg.type === 'document') {
           body = msg.document?.caption || `[Document: ${msg.document?.filename || 'file'}]`;
         } else if (msg.type === 'location') {
@@ -369,10 +557,25 @@ async function handleIncomingWebhook(entry) {
         console.log(`📩 [Tenant ${resolvedTenantId}] Incoming from ${phone}: ${body.substring(0, 50)}`);
 
         // Save conversation
-        await supabase.from('conversations').insert({
+        const insertData = {
           tenant_id: resolvedTenantId, phone, message: body,
           direction: 'incoming', status: 'received'
-        });
+        };
+        if (incomingMediaId) {
+          insertData.media_url = 'wamid:' + incomingMediaId;
+          console.log(`\ud83c\udf99\ufe0f Saving with media_url: ${insertData.media_url}`);
+        }
+        const { data: insertedRows, error: insertErr } = await supabase.from('conversations').insert(insertData).select('id, media_url');
+        if (insertErr) {
+          console.error(`❌ Insert error for ${phone}:`, insertErr.message, insertErr.details || '', insertErr.hint || '');
+          if (insertErr.message && insertErr.message.includes('media_url')) {
+            console.error('⚠️  media_url column missing! Run: ALTER TABLE conversations ADD COLUMN IF NOT EXISTS media_url TEXT;');
+            delete insertData.media_url;
+            await supabase.from('conversations').insert(insertData);
+          }
+        } else {
+          console.log(`✅ Saved conversation id=${insertedRows?.[0]?.id}, media_url=${insertedRows?.[0]?.media_url || 'NULL'}`);
+        }
 
         // Get contact name from webhook payload
         const contactName = contacts.find(c => c.wa_id === msg.from)?.profile?.name || 'Unknown';
@@ -419,7 +622,28 @@ async function handleIncomingWebhook(entry) {
     for (const status of statuses) {
       try {
         if (status.status === 'failed') {
-          console.warn(`⚠️  Message ${status.id} failed:`, status.errors?.[0]?.message);
+          const errCode = status.errors?.[0]?.code;
+          const errMsg = status.errors?.[0]?.message || 'Unknown error';
+          console.warn(`⚠️  Message ${status.id} failed: ${errMsg} (code: ${errCode})`);
+
+          // Detect ban-related error codes
+          // 131031 = Business account restricted/banned
+          // 368 = Temporarily blocked for policies violation
+          // 131026 = Message undeliverable (often means banned)
+          // 131056 = Pair rate limit hit (business account issue)
+          const banCodes = [131031, 368, 131026, 131056];
+          if (banCodes.includes(errCode)) {
+            waManager.markBanned(resolvedTenantId, `Error ${errCode}: ${errMsg}`);
+            // Log the ban event
+            try {
+              await supabase.from('activity_log').insert({
+                tenant_id: resolvedTenantId,
+                phone: status.recipient_id || 'system',
+                action: 'wa_banned',
+                details: `WhatsApp number banned/restricted. Error ${errCode}: ${errMsg}`
+              });
+            } catch (_) {}
+          }
         }
       } catch (_) {}
     }
@@ -435,25 +659,34 @@ const app = express();
 app.set('trust proxy', 1);
 
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
-app.use(cors());
+app.use(compression());
 app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
 const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, max: 20,
-  message: { error: 'Too many login attempts, please try again later' }
+  windowMs: 15 * 60 * 1000, max: 50,
+  message: { error: 'Too many login attempts, please try again later' },
+  standardHeaders: true, legacyHeaders: false
 });
 
 const sendLimiter = rateLimit({
   windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 60000,
-  max: parseInt(process.env.RATE_LIMIT_MAX) || 30,
-  message: { error: 'Sending too fast, please wait a moment' }
+  max: parseInt(process.env.RATE_LIMIT_MAX) || 60,
+  message: { error: 'Sending too fast, please wait a moment' },
+  standardHeaders: true, legacyHeaders: false
+});
+
+// General API limiter for all tenant endpoints (prevents any single source from overwhelming)
+const apiLimiter = rateLimit({
+  windowMs: 60000, max: 200,
+  message: { error: 'Too many requests, please slow down' },
+  standardHeaders: true, legacyHeaders: false
 });
 
 // ── Auth Middleware ──────────────────────────
-function verifyToken(req) {
-  const token = req.cookies?.crm_token;
+function verifyToken(req, cookieName = 'crm_token') {
+  const token = req.cookies?.[cookieName];
   if (!token) return null;
   try {
     return jwt.verify(token, JWT_SECRET);
@@ -462,23 +695,67 @@ function verifyToken(req) {
   }
 }
 
+// Find tenant token from tenant-specific cookie using X-Tenant-ID header or scan
+function verifyTenantToken(req) {
+  // 1. Try X-Tenant-ID header (sent by frontend)
+  const headerTid = req.headers['x-tenant-id'];
+  if (headerTid) {
+    const decoded = verifyToken(req, `crm_token_${headerTid}`);
+    if (decoded && decoded.role === 'tenant') return decoded;
+  }
+  // 2. Fallback: scan all crm_token_* cookies
+  for (const [name, value] of Object.entries(req.cookies || {})) {
+    if (name.startsWith('crm_token_') && name !== 'crm_token_') {
+      try {
+        const decoded = jwt.verify(value, JWT_SECRET);
+        if (decoded && decoded.role === 'tenant') return decoded;
+      } catch {}
+    }
+  }
+  // 3. Legacy fallback: old crm_token cookie
+  return verifyToken(req, 'crm_token');
+}
+
+// ── Tenant verification cache (avoids DB hit on every API call) ──
+const tenantVerifyCache = new Map(); // tenantId -> { active, ts }
+const TENANT_CACHE_TTL = 120000; // 120s (2 min) — reduces DB hits for 100+ marketers
+
+function isTenantCachedActive(tenantId) {
+  const cached = tenantVerifyCache.get(tenantId);
+  if (cached && (Date.now() - cached.ts) < TENANT_CACHE_TTL) return cached.active;
+  return null;
+}
+
 async function tenantAuth(req, res, next) {
-  const decoded = verifyToken(req);
+  const decoded = verifyTenantToken(req);
   if (!decoded || decoded.role !== 'tenant') {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  const { data: tenant } = await supabase.from('tenants')
-    .select('id, is_active').eq('id', decoded.tenant_id).maybeSingle();
-  if (!tenant || !tenant.is_active) {
+  // Check cache first to avoid DB query on every request
+  const cachedActive = isTenantCachedActive(decoded.tenant_id);
+  if (cachedActive === false) {
+    res.clearCookie(`crm_token_${decoded.tenant_id}`);
     res.clearCookie('crm_token');
     return res.status(401).json({ error: 'Account deleted or deactivated' });
+  }
+  if (cachedActive === null) {
+    const { data: tenant } = await supabase.from('tenants')
+      .select('id, is_active').eq('id', decoded.tenant_id).maybeSingle();
+    const isActive = !!(tenant && tenant.is_active);
+    tenantVerifyCache.set(decoded.tenant_id, { active: isActive, ts: Date.now() });
+    if (!isActive) {
+      res.clearCookie(`crm_token_${decoded.tenant_id}`);
+      res.clearCookie('crm_token');
+      return res.status(401).json({ error: 'Account deleted or deactivated' });
+    }
   }
 
   req.tenantId = decoded.tenant_id;
   req.tenantName = decoded.name;
   req.tenantUsername = decoded.username;
 
+  const cookieName = `crm_token_${decoded.tenant_id}`;
   const now = Math.floor(Date.now() / 1000);
   const tokenAge = now - (decoded.iat || 0);
   if (tokenAge > 300) {
@@ -486,7 +763,7 @@ async function tenantAuth(req, res, next) {
       tenant_id: decoded.tenant_id, username: decoded.username,
       name: decoded.name, role: 'tenant'
     }, JWT_SECRET, { expiresIn: '30m' });
-    res.cookie('crm_token', newToken, {
+    res.cookie(cookieName, newToken, {
       httpOnly: true, secure: false, sameSite: 'lax',
       maxAge: 30 * 60 * 1000
     });
@@ -496,22 +773,11 @@ async function tenantAuth(req, res, next) {
 }
 
 function adminAuth(req, res, next) {
-  const decoded = verifyToken(req);
+  const decoded = verifyToken(req, 'crm_admin_token');
   if (!decoded || decoded.role !== 'admin') {
     return res.status(401).json({ error: 'Unauthorized - Admin access required' });
   }
   req.adminUsername = decoded.username;
-  next();
-}
-
-function anyAuth(req, res, next) {
-  const decoded = verifyToken(req);
-  if (!decoded) return res.status(401).json({ error: 'Unauthorized' });
-  req.userRole = decoded.role;
-  if (decoded.role === 'tenant') {
-    req.tenantId = decoded.tenant_id;
-    req.tenantName = decoded.name;
-  }
   next();
 }
 
@@ -575,7 +841,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
       name: tenant.name, role: 'tenant'
     }, JWT_SECRET, { expiresIn: '30m' });
 
-    res.cookie('crm_token', token, {
+    res.cookie(`crm_token_${tenant.id}`, token, {
       httpOnly: true, secure: false, sameSite: 'lax',
       maxAge: 30 * 60 * 1000
     });
@@ -603,7 +869,7 @@ app.post('/api/auth/admin-login', loginLimiter, async (req, res) => {
 
     const token = jwt.sign({ role: 'admin', username: ADMIN_USERNAME }, JWT_SECRET, { expiresIn: '24h' });
 
-    res.cookie('crm_token', token, {
+    res.cookie('crm_admin_token', token, {
       httpOnly: true, secure: false, sameSite: 'lax',
       maxAge: 24 * 60 * 60 * 1000
     });
@@ -615,18 +881,35 @@ app.post('/api/auth/admin-login', loginLimiter, async (req, res) => {
 });
 
 app.post('/api/auth/logout', (req, res) => {
-  res.clearCookie('crm_token');
+  const role = req.query.role;
+  if (role === 'admin') {
+    res.clearCookie('crm_admin_token');
+  } else {
+    const tid = req.query.tid || req.headers['x-tenant-id'];
+    if (tid) {
+      res.clearCookie(`crm_token_${tid}`);
+    }
+    // Also clear legacy cookie
+    res.clearCookie('crm_token');
+  }
   res.json({ success: true });
 });
 
 app.get('/api/auth/check', async (req, res) => {
-  const decoded = verifyToken(req);
+  const role = req.query.role;
+  let decoded;
+  if (role === 'admin') {
+    decoded = verifyToken(req, 'crm_admin_token');
+  } else {
+    decoded = verifyTenantToken(req);
+  }
   if (!decoded) return res.status(401).json({ authenticated: false });
 
   if (decoded.role === 'tenant') {
     const { data: tenant } = await supabase.from('tenants')
       .select('id, is_active').eq('id', decoded.tenant_id).maybeSingle();
     if (!tenant || !tenant.is_active) {
+      res.clearCookie(`crm_token_${decoded.tenant_id}`);
       res.clearCookie('crm_token');
       return res.status(401).json({ authenticated: false, reason: 'deleted' });
     }
@@ -970,8 +1253,9 @@ app.post('/api/admin/storage/cleanup-orphans', adminAuth, async (req, res) => {
 // ══════════════════════════════════════════════
 
 // ── Health / Status ─────────────────────────
-app.get('/api/health', tenantAuth, (req, res) => {
+app.get('/api/health', apiLimiter, tenantAuth, (req, res) => {
   const status = waManager.getStatus(req.tenantId);
+  res.set('Cache-Control', 'private, max-age=5');
   res.json({
     status: 'ok', whatsapp: status,
     uptime: Math.floor(process.uptime()),
@@ -982,7 +1266,29 @@ app.get('/api/health', tenantAuth, (req, res) => {
 app.get('/api/connection-status', tenantAuth, (req, res) => {
   const status = waManager.getStatus(req.tenantId);
   const ready = status === 'connected';
-  res.json({ ready, status });
+  const cfg = waManager.getConfig(req.tenantId);
+  const result = { ready, status };
+  if (status === 'banned' && cfg) {
+    result.banned_reason = cfg.banned_reason || 'Unknown';
+    result.banned_at = cfg.banned_at || null;
+  }
+  res.set('Cache-Control', 'private, max-age=10');
+  res.json(result);
+});
+
+// ── Manual Ban/Unban Status ─────────────────
+app.post('/api/connection-status', tenantAuth, async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (status === 'banned') {
+      waManager.markBanned(req.tenantId, 'Manually set to banned by user');
+    } else {
+      waManager.clearBan(req.tenantId);
+    }
+    res.json({ success: true, status: waManager.getStatus(req.tenantId) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Send Reply ──────────────────────────────
@@ -1000,48 +1306,146 @@ app.post('/api/send-reply', tenantAuth, sendLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Invalid phone number format' });
     }
 
-    await delay(MESSAGE_DELAY_MS);
+    // Send immediately for replies (no delay needed for user-initiated messages)
     await waManager.sendMessage(req.tenantId, cleanedPhone, message);
 
-    // Store outgoing message
-    await supabase.from('conversations').insert({
-      tenant_id: req.tenantId, phone: cleanedPhone, message,
-      direction: 'outgoing', status: 'sent'
-    });
+    const now = new Date().toISOString();
+    // Store outgoing message + update lead timestamp in parallel
+    await Promise.all([
+      supabase.from('conversations').insert({
+        tenant_id: req.tenantId, phone: cleanedPhone, message,
+        direction: 'outgoing', status: 'sent'
+      }),
+      supabase.from('leads')
+        .update({ last_message_at: now })
+        .eq('tenant_id', req.tenantId).eq('phone', cleanedPhone)
+    ]);
 
-    await supabase.from('leads')
-      .update({ last_message_at: new Date().toISOString() })
-      .eq('tenant_id', req.tenantId).eq('phone', cleanedPhone);
-
-    res.json({ success: true, phone: cleanedPhone });
+    res.json({ success: true, phone: cleanedPhone, timestamp: now });
   } catch (err) {
     res.status(500).json({ error: err.message || 'Failed to send message' });
   }
 });
 
-// ── Messages ────────────────────────────────
-app.get('/api/messages', tenantAuth, async (req, res) => {
+// ── Send Voice Message ──────────────────────
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 16 * 1024 * 1024 } });
+
+app.post('/api/send-voice', tenantAuth, sendLimiter, upload.single('audio'), async (req, res) => {
   try {
-    const { phone, limit = 50 } = req.query;
-    let query = supabase.from('conversations').select('*')
-      .eq('tenant_id', req.tenantId)
-      .order('created_at', { ascending: false }).limit(parseInt(limit));
-    if (phone) query = query.eq('phone', phone);
-    const { data, error } = await query;
-    if (error) throw error;
-    res.json(data || []);
+    const phone = req.body.phone;
+    if (!phone) return res.status(400).json({ error: 'Phone is required' });
+    if (!req.file) return res.status(400).json({ error: 'Audio file is required' });
+
+    if (!waManager.isReady(req.tenantId)) {
+      return res.status(503).json({ error: 'WhatsApp Cloud API not configured. Contact admin.' });
+    }
+
+    const cleanedPhone = phone.replace(/\D/g, '');
+    if (cleanedPhone.length < 10 || cleanedPhone.length > 15) {
+      return res.status(400).json({ error: 'Invalid phone number format' });
+    }
+
+    // Upload audio to WhatsApp Media API
+    const mimeType = req.file.mimetype || 'audio/ogg';
+    const mediaId = await waManager.uploadMedia(req.tenantId, req.file.buffer, mimeType);
+
+    // Send audio message using the uploaded media ID
+    await waManager.sendAudioById(req.tenantId, cleanedPhone, mediaId);
+
+    const now = new Date().toISOString();
+    // Store outgoing voice message + update lead timestamp
+    await Promise.all([
+      supabase.from('conversations').insert({
+        tenant_id: req.tenantId, phone: cleanedPhone,
+        message: '\ud83c\udfa4 Voice message',
+        direction: 'outgoing', status: 'sent',
+        media_url: 'wamid:' + mediaId
+      }),
+      supabase.from('leads')
+        .update({ last_message_at: now })
+        .eq('tenant_id', req.tenantId).eq('phone', cleanedPhone)
+    ]);
+
+    res.json({ success: true, phone: cleanedPhone, timestamp: now, media_url: 'wamid:' + mediaId });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch messages' });
+    res.status(500).json({ error: err.message || 'Failed to send voice message' });
   }
 });
 
+// ── Audio Proxy (stream WhatsApp media with auth) ────
+app.get('/api/audio-proxy/:conversationId', tenantAuth, async (req, res) => {
+  try {
+    const convId = parseInt(req.params.conversationId);
+    console.log(`🔊 Audio proxy request for conversation ${convId}, tenant ${req.tenantId}`);
+    if (!convId) return res.status(400).json({ error: 'Invalid conversation ID' });
+
+    // Fetch the conversation to get media_url
+    const { data: conv } = await supabase.from('conversations')
+      .select('media_url')
+      .eq('id', convId).eq('tenant_id', req.tenantId).maybeSingle();
+
+    if (!conv || !conv.media_url) {
+      console.log(`🔊 No media_url found for conversation ${convId}`);
+      return res.status(404).json({ error: 'Audio not found' });
+    }
+    console.log(`🔊 media_url: ${conv.media_url}`);
+
+    const cfg = waManager.getConfig(req.tenantId);
+    if (!cfg || !cfg.access_token) {
+      return res.status(503).json({ error: 'WhatsApp not configured' });
+    }
+
+    let mediaUrl = conv.media_url;
+
+    // If stored as wamid:XXXX, resolve to actual download URL first
+    if (mediaUrl.startsWith('wamid:')) {
+      const mediaId = mediaUrl.replace('wamid:', '');
+      const metaRes = await fetch(`https://graph.facebook.com/${GRAPH_API_VERSION}/${mediaId}`, {
+        headers: { 'Authorization': `Bearer ${cfg.access_token}` }
+      });
+      const metaData = await metaRes.json();
+      if (!metaRes.ok || !metaData.url) {
+        console.error('Media URL resolve failed:', metaData);
+        return res.status(502).json({ error: 'Failed to resolve media URL' });
+      }
+      mediaUrl = metaData.url;
+    }
+
+    // Download the actual audio binary from WhatsApp CDN
+    const audioRes = await fetch(mediaUrl, {
+      headers: { 'Authorization': `Bearer ${cfg.access_token}` }
+    });
+
+    if (!audioRes.ok) {
+      return res.status(502).json({ error: 'Failed to download audio' });
+    }
+
+    // Stream the audio to the client
+    const contentType = audioRes.headers.get('content-type') || 'audio/ogg';
+    const arrayBuf = await audioRes.arrayBuffer();
+    const audioBuf = Buffer.from(arrayBuf);
+    console.log(`🔊 Proxying ${audioBuf.length} bytes, type: ${contentType}`);
+    res.set('Content-Type', contentType);
+    res.set('Content-Length', audioBuf.length);
+    res.set('Accept-Ranges', 'bytes');
+    res.set('Cache-Control', 'private, max-age=3600');
+    res.send(audioBuf);
+  } catch (err) {
+    console.error('Audio proxy error:', err.message);
+    res.status(500).json({ error: 'Failed to proxy audio' });
+  }
+});
+
+// ── Messages ────────────────────────────────
 app.get('/api/messages/:phone', tenantAuth, async (req, res) => {
   try {
     const phone = req.params.phone.replace(/\D/g, '');
     const { data, error } = await supabase.from('conversations')
-      .select('*').eq('tenant_id', req.tenantId).eq('phone', phone)
+      .select('id, phone, message, direction, status, created_at, media_url')
+      .eq('tenant_id', req.tenantId).eq('phone', phone)
       .order('created_at', { ascending: true }).limit(200);
     if (error) throw error;
+    res.set('Cache-Control', 'private, max-age=5');
     res.json(data || []);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch chat' });
@@ -1099,17 +1503,21 @@ app.put('/api/leads/:phone', tenantAuth, async (req, res) => {
     if (notes !== undefined) updates.notes = String(notes).substring(0, 5000);
     if (source !== undefined) updates.source = String(source).substring(0, 50);
 
-    const { data, error } = await supabase.from('leads')
-      .update(updates).eq('tenant_id', req.tenantId).eq('phone', phone).select().single();
-    if (error) throw error;
+    const result = await supabase.from('leads')
+      .update(updates).eq('tenant_id', req.tenantId).eq('phone', phone);
+    if (result.error) {
+      console.error('❌ Supabase lead update error:', JSON.stringify(result.error));
+      throw result.error;
+    }
 
-    await supabase.from('activity_log').insert({
+    supabase.from('activity_log').insert({
       tenant_id: req.tenantId, phone, action: 'lead_updated',
       details: `Updated: ${Object.keys(updates).join(', ')}`
-    }).catch(() => {});
+    }).then(() => {}).catch(() => {});
 
-    res.json(data);
+    res.json({ success: true });
   } catch (err) {
+    console.error('❌ Lead update error:', err.message || err);
     res.status(500).json({ error: 'Failed to update lead' });
   }
 });
@@ -1130,10 +1538,35 @@ app.post('/api/leads/:phone/resolve', tenantAuth, async (req, res) => {
   res.json({ success: true, real_phone: phone });
 });
 
+// ── In-memory response cache for heavy read endpoints ──
+const responseCache = new Map(); // key -> { data, ts }
+const RESP_CACHE_TTL = 10000; // 10s for stats
+const RESP_CACHE_TTL_LONG = 30000; // 30s for analytics
+
+function getCachedResponse(key) {
+  const cached = responseCache.get(key);
+  if (cached && (Date.now() - cached.ts) < cached.ttl) return cached.data;
+  return null;
+}
+
+function setCachedResponse(key, data, ttl = RESP_CACHE_TTL) {
+  responseCache.set(key, { data, ts: Date.now(), ttl });
+  // Evict old entries periodically
+  if (responseCache.size > 500) {
+    const now = Date.now();
+    for (const [k, v] of responseCache) {
+      if (now - v.ts > v.ttl) responseCache.delete(k);
+    }
+  }
+}
+
 // ── Stats ───────────────────────────────────
 app.get('/api/stats', tenantAuth, async (req, res) => {
   try {
     const tid = req.tenantId;
+    const cacheKey = `stats_${tid}`;
+    const cached = getCachedResponse(cacheKey);
+    if (cached) { res.set('Cache-Control', 'private, max-age=10'); return res.json(cached); }
     const [leadsRes, soldRes, newRes, intRes, contRes, revenueRes, msgsRes, inRes, outRes] = await Promise.all([
       supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid),
       supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('status', 'sold'),
@@ -1151,13 +1584,16 @@ app.get('/api/stats', tenantAuth, async (req, res) => {
 
     const totalRevenue = (revenueRes.data || []).reduce((sum, l) => sum + (parseFloat(l.revenue) || 0), 0);
 
-    res.json({
+    const result = {
       total_leads: leadsRes.count || 0, new_leads: newRes.count || 0,
       sold_leads: soldRes.count || 0, interested_leads: intRes.count || 0,
       contacted_leads: contRes.count || 0, total_revenue: totalRevenue,
       messages_today: msgsRes.count || 0, incoming_today: inRes.count || 0,
       outgoing_today: outRes.count || 0
-    });
+    };
+    setCachedResponse(cacheKey, result);
+    res.set('Cache-Control', 'private, max-age=10');
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch stats' });
   }
@@ -1166,6 +1602,10 @@ app.get('/api/stats', tenantAuth, async (req, res) => {
 app.get('/api/stats/trends', tenantAuth, async (req, res) => {
   try {
     const days = parseInt(req.query.days) || 7;
+    const cacheKey = `trends_${req.tenantId}_${days}`;
+    const cached = getCachedResponse(cacheKey);
+    if (cached) { res.set('Cache-Control', 'private, max-age=30'); return res.json(cached); }
+
     const since = new Date(Date.now() - days * 86400000).toISOString();
     const { data, error } = await supabase.from('conversations')
       .select('direction, created_at').eq('tenant_id', req.tenantId)
@@ -1178,6 +1618,8 @@ app.get('/api/stats/trends', tenantAuth, async (req, res) => {
       if (!trends[day]) trends[day] = { incoming: 0, outgoing: 0 };
       trends[day][msg.direction]++;
     });
+    setCachedResponse(cacheKey, trends, RESP_CACHE_TTL_LONG);
+    res.set('Cache-Control', 'private, max-age=30');
     res.json(trends);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch trends' });
@@ -1379,13 +1821,51 @@ app.post('/api/broadcasts/:id/send', tenantAuth, async (req, res) => {
   }
 });
 
+// ── Cancel a sending broadcast ──────────────
+const cancelledBroadcasts = new Set();
+
+app.post('/api/broadcasts/:id/cancel', tenantAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { data: broadcast } = await supabase.from('broadcasts')
+      .select('status').eq('id', id).eq('tenant_id', req.tenantId).maybeSingle();
+    if (!broadcast) return res.status(404).json({ error: 'Broadcast not found' });
+    if (broadcast.status !== 'sending') return res.status(400).json({ error: 'Broadcast is not currently sending' });
+
+    cancelledBroadcasts.add(id);
+    res.json({ success: true, message: 'Cancel signal sent' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to cancel broadcast' });
+  }
+});
+
 async function sendBroadcastAsync(tenantId, broadcastId, message) {
   try {
     const { data: recipients } = await supabase.from('broadcast_recipients')
       .select('*').eq('broadcast_id', broadcastId).eq('status', 'pending');
 
     let sentCount = 0, failedCount = 0;
-    for (const recipient of (recipients || [])) {
+    for (let i = 0; i < (recipients || []).length; i++) {
+      const recipient = recipients[i];
+      // Check if broadcast was cancelled
+      if (cancelledBroadcasts.has(broadcastId)) {
+        cancelledBroadcasts.delete(broadcastId);
+        // Mark remaining pending recipients as cancelled in DB
+        const remainingIds = recipients.slice(i).map(r => r.id);
+        if (remainingIds.length > 0) {
+          await supabase.from('broadcast_recipients')
+            .update({ status: 'failed', error_message: 'Broadcast cancelled' })
+            .in('id', remainingIds);
+          failedCount += remainingIds.length;
+        }
+        await supabase.from('broadcasts').update({
+          status: 'cancelled', sent_count: sentCount, failed_count: failedCount,
+          completed_at: new Date().toISOString()
+        }).eq('id', broadcastId);
+        console.log(`⛔ Broadcast ${broadcastId} cancelled by user. Sent: ${sentCount}, Skipped: ${remainingIds.length}`);
+        return;
+      }
+
       try {
         if (!waManager.isReady(tenantId)) {
           await supabase.from('broadcast_recipients')
@@ -1522,32 +2002,66 @@ app.get('/api/leads/export', tenantAuth, async (req, res) => {
   }
 });
 
-// ── Active Chats ────────────────────────────
+// ── Active Chats (OPTIMIZED: 3 queries instead of N*2+1) ────
 app.get('/api/active-chats', tenantAuth, async (req, res) => {
   try {
-    const { data: leads, error } = await supabase.from('leads')
-      .select('*').eq('tenant_id', req.tenantId)
-      .order('last_message_at', { ascending: false }).limit(100);
+    const tid = req.tenantId;
+    const since = req.query.since || null; // ISO timestamp for incremental updates
+
+    // If client sends 'since', return only leads updated after that time
+    let leadsQuery = supabase.from('leads')
+      .select('id, phone, real_phone, name, email, company, source, status, tags, notes, revenue, assigned_to, created_at, last_message_at')
+      .eq('tenant_id', tid);
+    if (since) {
+      leadsQuery = leadsQuery.gte('last_message_at', since);
+    }
+    leadsQuery = leadsQuery.order('last_message_at', { ascending: false }).limit(200);
+
+    const { data: leads, error } = await leadsQuery;
     if (error) throw error;
+    if (!leads || leads.length === 0) return res.json([]);
 
-    const chats = await Promise.all(
-      (leads || []).map(async (lead) => {
-        const { data: msgs } = await supabase.from('conversations')
-          .select('message, direction, created_at')
-          .eq('tenant_id', req.tenantId).eq('phone', lead.phone)
-          .order('created_at', { ascending: false }).limit(1);
+    const phones = leads.map(l => l.phone);
 
-        const unreadRes = await supabase.from('conversations')
-          .select('id', { count: 'exact', head: true })
-          .eq('tenant_id', req.tenantId).eq('phone', lead.phone)
-          .eq('direction', 'incoming').eq('status', 'received');
+    // Batch: get last message for all leads in ONE query using RPC or multiple-filter
+    // We'll get recent conversations and group by phone in JS
+    const { data: recentMsgs } = await supabase.from('conversations')
+      .select('phone, message, direction, created_at')
+      .eq('tenant_id', tid)
+      .in('phone', phones)
+      .order('created_at', { ascending: false })
+      .limit(phones.length * 2); // 2x to ensure at least 1 per phone
 
-        return { ...lead, last_message: msgs?.[0] || null, unread_count: unreadRes.count || 0 };
-      })
-    );
+    // Batch: get unread counts for all phones in ONE query
+    const { data: unreadRows } = await supabase.from('conversations')
+      .select('phone')
+      .eq('tenant_id', tid)
+      .in('phone', phones)
+      .eq('direction', 'incoming')
+      .eq('status', 'received');
+
+    // Build lookup maps
+    const lastMsgMap = new Map();
+    for (const msg of (recentMsgs || [])) {
+      if (!lastMsgMap.has(msg.phone)) {
+        lastMsgMap.set(msg.phone, { message: msg.message, direction: msg.direction, created_at: msg.created_at });
+      }
+    }
+
+    const unreadMap = new Map();
+    for (const row of (unreadRows || [])) {
+      unreadMap.set(row.phone, (unreadMap.get(row.phone) || 0) + 1);
+    }
+
+    const chats = leads.map(lead => ({
+      ...lead,
+      last_message: lastMsgMap.get(lead.phone) || null,
+      unread_count: unreadMap.get(lead.phone) || 0
+    }));
 
     res.json(chats);
   } catch (err) {
+    console.error('Active chats error:', err.message);
     res.status(500).json({ error: 'Failed to fetch active chats' });
   }
 });
@@ -1555,38 +2069,61 @@ app.get('/api/active-chats', tenantAuth, async (req, res) => {
 // ══════════════════════════════════════════════
 // PAGE ROUTES
 // ══════════════════════════════════════════════
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), {
+  maxAge: '1h',
+  etag: true,
+  lastModified: true
+}));
 
 app.get('/', (req, res) => {
-  const decoded = verifyToken(req);
-  if (!decoded) return res.redirect('/login');
-  if (decoded.role === 'admin') return res.redirect('/admin');
-  return res.redirect('/crm');
+  const decoded = verifyTenantToken(req);
+  if (decoded && decoded.role === 'tenant') return res.redirect(`/crm/${decoded.tenant_id}`);
+  const adminDecoded = verifyToken(req, 'crm_admin_token');
+  if (adminDecoded && adminDecoded.role === 'admin') return res.redirect('/admin');
+  return res.redirect('/login');
 });
 
 app.get('/login', (req, res) => {
-  const decoded = verifyToken(req);
+  const decoded = verifyTenantToken(req);
   if (decoded) {
     if (decoded.role === 'admin') return res.redirect('/admin');
-    return res.redirect('/crm');
+    return res.redirect(`/crm/${decoded.tenant_id}`);
   }
+  const adminDecoded = verifyToken(req, 'crm_admin_token');
+  if (adminDecoded && adminDecoded.role === 'admin') return res.redirect('/admin');
   res.sendFile(path.join(__dirname, 'public', 'login.html'));
 });
 
 app.get('/admin', (req, res) => {
-  const decoded = verifyToken(req);
+  const decoded = verifyToken(req, 'crm_admin_token');
   if (!decoded || decoded.role !== 'admin') return res.redirect('/login');
   res.sendFile(path.join(__dirname, 'public', 'admin.html'));
 });
 
+// Support both /crm and /crm/:tid for backward compat
 app.get('/crm', async (req, res) => {
-  const decoded = verifyToken(req);
+  const decoded = verifyTenantToken(req);
   if (!decoded || decoded.role !== 'tenant') return res.redirect('/login');
+  return res.redirect(`/crm/${decoded.tenant_id}`);
+});
+
+app.get('/crm/:tid', async (req, res) => {
+  const tid = parseInt(req.params.tid);
+  if (!tid || isNaN(tid)) return res.redirect('/login');
+
+  const decoded = verifyToken(req, `crm_token_${tid}`);
+  // Fallback to legacy cookie or scan
+  const fallback = !decoded ? verifyTenantToken(req) : null;
+  const authDecoded = decoded || fallback;
+
+  if (!authDecoded || authDecoded.role !== 'tenant' || authDecoded.tenant_id !== tid) {
+    return res.redirect('/login');
+  }
 
   const { data: tenant } = await supabase.from('tenants')
-    .select('id, is_active').eq('id', decoded.tenant_id).maybeSingle();
+    .select('id, is_active').eq('id', tid).maybeSingle();
   if (!tenant || !tenant.is_active) {
-    res.clearCookie('crm_token');
+    res.clearCookie(`crm_token_${tid}`);
     return res.redirect('/login');
   }
 
@@ -1594,6 +2131,10 @@ app.get('/crm', async (req, res) => {
 });
 
 app.get('*', (req, res) => {
+  // Don't redirect API calls or static asset requests
+  if (req.path.startsWith('/api/')) {
+    return res.status(404).json({ error: 'Not found' });
+  }
   res.redirect('/');
 });
 
