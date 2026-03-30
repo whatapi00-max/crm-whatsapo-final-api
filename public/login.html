@@ -121,7 +121,9 @@
       if (data.authenticated && data.role === 'admin') {
         window.location.href = '/admin';
       }
-      // Don't redirect tenants — they may be here to re-login
+      if (data.authenticated && data.role === 'tenant' && data.tenant_id) {
+        window.location.href = '/crm/' + data.tenant_id;
+      }
     }).catch(() => {});
 
     function switchTab(tab) {
@@ -153,7 +155,7 @@
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Login failed');
-        window.location.href = '/crm';
+        window.location.href = '/crm/' + data.user.id;
       } catch (err) {
         errEl.textContent = err.message;
         errEl.classList.remove('hidden');

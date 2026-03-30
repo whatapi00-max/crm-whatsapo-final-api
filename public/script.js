@@ -81,6 +81,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   loadQuickReplies();
   startAutoRefresh();
   startSessionCheck();
+  startWarningPoll();
 });
 
 // ── Session Timeout Monitor ────────────────
@@ -94,6 +95,68 @@ function startSessionCheck() {
       }
     } catch {}
   }, 60000);
+}
+
+// ── Admin Warning Freeze System ─────────────
+let _warnActive = false;
+
+async function checkWarnOnce() {
+  try {
+    const res = await fetch('/api/warn-check', { headers: tenantHeaders() });
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.warned) triggerAdminFreeze(data.message, data.remaining_seconds || 60);
+  } catch {}
+}
+
+function startWarningPoll() {
+  // Check immediately on load – catches active freeze after page refresh
+  checkWarnOnce();
+  setInterval(async () => {
+    if (_warnActive) return; // already frozen, don't poll
+    try {
+      const res = await fetch('/api/warn-check', { headers: tenantHeaders() });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.warned) triggerAdminFreeze(data.message, data.remaining_seconds || 60);
+    } catch {}
+  }, 5000); // poll every 5 seconds
+}
+
+function triggerAdminFreeze(message, totalSecs) {
+  if (_warnActive) return; // prevent double-trigger
+  _warnActive = true;
+  const secs = Math.max(1, Math.round(totalSecs || 60));
+  const overlay = document.getElementById('admin-warning-overlay');
+  const msgEl = document.getElementById('admin-warning-msg');
+  const countdown = document.getElementById('warn-countdown');
+  const bar = document.getElementById('warn-progress-bar');
+  if (!overlay) return;
+
+  msgEl.textContent = message;
+  overlay.style.display = 'flex';
+  countdown.textContent = String(secs);
+  bar.style.transition = 'none';
+  bar.style.width = '100%';
+
+  let remaining = secs;
+  // Start shrink animation after first paint
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      bar.style.transition = `width ${remaining}s linear`;
+      bar.style.width = '0%';
+    });
+  });
+
+  const tick = setInterval(() => {
+    remaining--;
+    countdown.textContent = String(remaining);
+    if (remaining <= 0) {
+      clearInterval(tick);
+      overlay.style.display = 'none';
+      _warnActive = false;
+    }
+  }, 1000);
 }
 
 // ── Logout ─────────────────────────────────

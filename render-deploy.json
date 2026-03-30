@@ -1,0 +1,29 @@
+{
+  "ownerId": "tea-d6ko5l95pdvs7385t0sg",
+  "type": "web_service",
+  "name": "whatsapp-crm-pro",
+  "repo": "https://github.com/whatapi00-max/crm-whatsapo-final-api",
+  "branch": "master",
+  "autoDeploy": "yes",
+  "serviceDetails": {
+    "env": "node",
+    "plan": "free",
+    "region": "oregon",
+    "healthCheckPath": "/api/health",
+    "envSpecificDetails": {
+      "buildCommand": "npm install",
+      "startCommand": "node server.js"
+    }
+  },
+  "envVars": [
+    { "key": "SUPABASE_URL", "value": "https://ygsebdwiosulesculvhn.supabase.co" },
+    { "key": "SUPABASE_KEY", "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inlnc2ViZHdpb3N1bGVzY3VsdmhuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM3Mzk1NTIsImV4cCI6MjA4OTMxNTU1Mn0.DBUft29ccqTQzJ_zJeNlmcQO7qIX6f6nArMHRByYeeg" },
+    { "key": "ADMIN_USERNAME", "value": "logandev" },
+    { "key": "ADMIN_PASSWORD", "value": "@billy777aass1122" },
+    { "key": "JWT_SECRET", "value": "b6b8cee6ab48c2b85afb1931703bb30cfd77747029ab2309b96a817fa88e7ba1" },
+    { "key": "WEBHOOK_VERIFY_TOKEN", "value": "billy777_verify" },
+    { "key": "NODE_ENV", "value": "production" },
+    { "key": "MESSAGE_DELAY_MS", "value": "2500" },
+    { "key": "GRAPH_API_VERSION", "value": "v21.0" }
+  ]
+}

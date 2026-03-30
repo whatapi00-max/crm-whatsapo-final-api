@@ -233,32 +233,6 @@
 .broadcast-status.completed { background: rgba(34,197,94,0.15); color: #4ade80; }
 .broadcast-status.failed { background: rgba(239,68,68,0.15); color: #f87171; }
 
-/* ── Template Card ───────────────────── */
-.template-card {
-  padding: 16px;
-  border-radius: 16px;
-  background: rgba(26,26,46,0.5);
-  border: 1px solid rgba(255,255,255,0.06);
-  transition: all 0.2s;
-  cursor: pointer;
-}
-.template-card:hover {
-  border-color: rgba(37,211,102,0.3);
-  transform: translateY(-2px);
-  box-shadow: 0 8px 20px rgba(0,0,0,0.2);
-}
-.template-category-badge {
-  font-size: 10px;
-  padding: 2px 8px;
-  border-radius: 6px;
-  font-weight: 600;
-  text-transform: uppercase;
-}
-.cat-marketing { background: rgba(139,92,246,0.15); color: #a78bfa; }
-.cat-transactional { background: rgba(59,130,246,0.15); color: #60a5fa; }
-.cat-utility { background: rgba(245,158,11,0.15); color: #fbbf24; }
-.cat-greeting { background: rgba(34,197,94,0.15); color: #4ade80; }
-
 /* ── Auto-Reply Card ─────────────────── */
 .auto-reply-card {
   padding: 16px 20px;
@@ -433,18 +407,15 @@
 /* ── Stat Cards ───────────────────────── */
 .stat-card {
   background: rgba(26, 26, 46, 0.5);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 1rem;
   padding: 1rem;
-  transition: all 0.3s ease;
+  transition: border-color 0.2s, box-shadow 0.2s;
   cursor: pointer;
 }
 .stat-card:hover {
   border-color: rgba(37, 211, 102, 0.3);
-  transform: translateY(-2px);
-  box-shadow: 0 8px 25px rgba(0, 0, 0, 0.2);
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.15);
 }
 :root:not(.dark) .stat-card {
   background: rgba(255, 255, 255, 0.7);
@@ -643,11 +614,18 @@
   padding: 0.75rem 1.25rem;
   border-radius: 0.75rem;
   font-size: 0.85rem;
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  font-weight: 500;
   border: 1px solid rgba(255, 255, 255, 0.08);
   animation: slideInRight 0.3s ease-out;
   max-width: 360px;
+  word-break: break-word;
+  overflow-wrap: break-word;
+  cursor: default;
+}
+.toast.hiding {
+  opacity: 0;
+  transform: translateX(110%);
+  transition: opacity 0.3s ease, transform 0.3s ease;
 }
 .toast-success {
   background: rgba(34, 197, 94, 0.15);
@@ -698,6 +676,36 @@
 @keyframes bubbleIn {
   from { opacity: 0; transform: translateY(8px) scale(0.95); }
   to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* ── Voice Message Player ─────────────── */
+.voice-msg-player {
+  min-width: 200px;
+  padding: 4px 0;
+}
+.voice-msg-player audio {
+  display: none;
+}
+.voice-play-btn {
+  transition: transform 0.15s, background 0.2s;
+  flex-shrink: 0;
+}
+.voice-play-btn:active {
+  transform: scale(0.9);
+}
+.voice-play-btn.playing {
+  background: rgba(37, 211, 102, 0.3) !important;
+}
+.voice-progress-wrap {
+  position: relative;
+  min-width: 80px;
+  cursor: pointer;
+}
+.voice-progress {
+  transition: width 0.15s linear;
+}
+.voice-no-audio {
+  opacity: 0.7;
 }
 
 @keyframes slideInRight {
@@ -891,7 +899,6 @@ html:not(.dark) #info-panel [class*="border-white"] {
 /* ── Cards (all types) ────────────────── */
 html:not(.dark) .stat-card,
 html:not(.dark) .broadcast-card,
-html:not(.dark) .template-card,
 html:not(.dark) .auto-reply-card,
 html:not(.dark) .qr-card,
 html:not(.dark) .scheduled-card,
@@ -901,7 +908,6 @@ html:not(.dark) .stat-card-mini {
   box-shadow: 0 1px 3px rgba(0,0,0,0.04);
 }
 html:not(.dark) .stat-card:hover,
-html:not(.dark) .template-card:hover,
 html:not(.dark) .qr-card:hover {
   box-shadow: 0 8px 25px rgba(0,0,0,0.08);
   border-color: rgba(0,0,0,0.1);
@@ -913,7 +919,6 @@ html:not(.dark) .auto-reply-card:hover {
 
 /* ── Form Modals / Panels ─────────────── */
 html:not(.dark) #broadcast-form,
-html:not(.dark) #template-form,
 html:not(.dark) #auto-reply-form,
 html:not(.dark) #qr-form,
 html:not(.dark) #import-modal {
@@ -1018,11 +1023,23 @@ html:not(.dark) ::-webkit-scrollbar-thumb:hover {
 
 /* ── Toasts ───────────────────────────── */
 html:not(.dark) .toast {
-  border-color: rgba(0,0,0,0.08);
+  border-color: rgba(0,0,0,0.1);
 }
-html:not(.dark) .toast-success { background: rgba(34,197,94,0.1); }
-html:not(.dark) .toast-error { background: rgba(239,68,68,0.1); }
-html:not(.dark) .toast-info { background: rgba(59,130,246,0.1); }
+html:not(.dark) .toast-success {
+  background: rgba(34,197,94,0.12);
+  color: #16a34a;
+  border-color: rgba(34,197,94,0.3);
+}
+html:not(.dark) .toast-error {
+  background: rgba(239,68,68,0.1);
+  color: #dc2626;
+  border-color: rgba(239,68,68,0.25);
+}
+html:not(.dark) .toast-info {
+  background: rgba(59,130,246,0.1);
+  color: #2563eb;
+  border-color: rgba(59,130,246,0.25);
+}
 
 /* ── Quick Reply Buttons ──────────────── */
 html:not(.dark) .quick-reply-btn {
@@ -1067,7 +1084,6 @@ html:not(.dark) #page-analytics [class*="bg-dark"],
 html:not(.dark) #page-settings [class*="bg-dark"],
 html:not(.dark) #page-contacts [class*="bg-dark"],
 html:not(.dark) #page-broadcasts [class*="bg-dark"],
-html:not(.dark) #page-templates [class*="bg-dark"],
 html:not(.dark) #page-automation [class*="bg-dark"],
 html:not(.dark) #page-scheduled [class*="bg-dark"],
 html:not(.dark) #page-quick-replies [class*="bg-dark"] {

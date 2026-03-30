@@ -70,6 +70,22 @@ function isDuplicate(tenantId, msgId) {
   return false;
 }
 
+// ── Admin Notifications Store (in-memory) ──
+const adminNotifications = [];
+let notifIdCounter = 0;
+function pushAdminNotif(type, message, tenantId, tenantName) {
+  adminNotifications.unshift({
+    id: ++notifIdCounter,
+    type, // 'copy_paste', 'warn', 'error', 'info'
+    message,
+    tenant_id: tenantId || null,
+    tenant_name: tenantName || null,
+    timestamp: new Date().toISOString(),
+    read: false,
+  });
+  if (adminNotifications.length > 200) adminNotifications.length = 200;
+}
+
 // ══════════════════════════════════════════════
 // WHATSAPP CLOUD API MANAGER
 // ══════════════════════════════════════════════
@@ -764,7 +780,7 @@ async function tenantAuth(req, res, next) {
       name: decoded.name, role: 'tenant'
     }, JWT_SECRET, { expiresIn: '30m' });
     res.cookie(cookieName, newToken, {
-      httpOnly: true, secure: false, sameSite: 'lax',
+      httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       maxAge: 30 * 60 * 1000
     });
   }
@@ -842,7 +858,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
     }, JWT_SECRET, { expiresIn: '30m' });
 
     res.cookie(`crm_token_${tenant.id}`, token, {
-      httpOnly: true, secure: false, sameSite: 'lax',
+      httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       maxAge: 30 * 60 * 1000
     });
 
@@ -870,7 +886,7 @@ app.post('/api/auth/admin-login', loginLimiter, async (req, res) => {
     const token = jwt.sign({ role: 'admin', username: ADMIN_USERNAME }, JWT_SECRET, { expiresIn: '24h' });
 
     res.cookie('crm_admin_token', token, {
-      httpOnly: true, secure: false, sameSite: 'lax',
+      httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       maxAge: 24 * 60 * 60 * 1000
     });
 
@@ -1125,7 +1141,7 @@ app.get('/api/admin/tenants/:id/stats', adminAuth, async (req, res) => {
     const [leadsRes, msgsRes] = await Promise.all([
       supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', id),
       supabase.from('conversations').select('id', { count: 'exact', head: true })
-        .eq('tenant_id', id).gte('created_at', new Date(Date.now() - 86400000).toISOString())
+        .eq('tenant_id', id).eq('direction', 'outgoing').gte('created_at', new Date(Date.now() - 86400000).toISOString())
     ]);
     res.json({ leads: leadsRes.count || 0, messages_today: msgsRes.count || 0 });
   } catch (err) {
@@ -1248,6 +1264,127 @@ app.post('/api/admin/storage/cleanup-orphans', adminAuth, async (req, res) => {
   res.json({ cleaned: 0, freed_bytes: 0, freed_mb: 0 });
 });
 
+// ── Marketer Performance Dashboard ─────────
+app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
+  try {
+    const { data: allTenants, error } = await supabase.from('tenants')
+      .select('id, name, username, is_active')
+      .order('name', { ascending: true });
+    if (error) throw error;
+
+    const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+    const oneDayAgo = new Date(Date.now() - 86400000).toISOString();
+    const oneHourAgo = new Date(Date.now() - 3600000).toISOString();
+
+    const marketers = await Promise.all((allTenants || []).map(async (t) => {
+      const [leadsRes, msgsToday, weekData, incomingToday, hourData] = await Promise.all([
+        supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', t.id),
+        supabase.from('conversations').select('id', { count: 'exact', head: true })
+          .eq('tenant_id', t.id).eq('direction', 'outgoing').gte('created_at', oneDayAgo),
+        supabase.from('conversations').select('created_at')
+          .eq('tenant_id', t.id).eq('direction', 'outgoing').gte('created_at', sevenDaysAgo),
+        supabase.from('conversations').select('id', { count: 'exact', head: true })
+          .eq('tenant_id', t.id).eq('direction', 'incoming').gte('created_at', oneDayAgo),
+        supabase.from('conversations').select('message, phone')
+          .eq('tenant_id', t.id).eq('direction', 'outgoing').gte('created_at', oneHourAgo),
+      ]);
+
+      // Build 7-day chart: index 6 = today, index 0 = 6 days ago
+      const chart = new Array(7).fill(0);
+      const now = new Date();
+      (weekData.data || []).forEach(row => {
+        const d = Math.floor((now - new Date(row.created_at)) / 86400000);
+        if (d >= 0 && d < 7) chart[6 - d]++;
+      });
+
+      // Copy-paste: same message body sent to 3+ different phones in last hour
+      const byMsg = {};
+      (hourData.data || []).forEach(row => {
+        const k = (row.message || '').trim();
+        if (k.length < 5) return;
+        if (!byMsg[k]) byMsg[k] = new Set();
+        byMsg[k].add(row.phone);
+      });
+      const cpSets = Object.values(byMsg).filter(s => s.size >= 3);
+      const copyPasteWarn = cpSets.length > 0;
+      const copyPasteMax = copyPasteWarn ? Math.max(...cpSets.map(s => s.size)) : 0;
+
+      return {
+        id: t.id, name: t.name, username: t.username,
+        is_active: t.is_active, wa_status: waManager.getStatus(t.id),
+        stats: {
+          total_leads: leadsRes.count || 0,
+          messages_today: msgsToday.count || 0,
+          messages_week: (weekData.data || []).length,
+          incoming_today: incomingToday.count || 0,
+          weekly_chart: chart,
+        },
+        copy_paste_warning: copyPasteWarn,
+        copy_paste_max: copyPasteMax,
+      };
+    }));
+
+    res.json({
+      marketers,
+      total_messages_today: marketers.reduce((s, m) => s + m.stats.messages_today, 0),
+      total_messages_week: marketers.reduce((s, m) => s + m.stats.messages_week, 0),
+      copy_paste_alerts: marketers.filter(m => m.copy_paste_warning).length,
+    });
+  } catch (err) {
+    console.error('Dashboard error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch dashboard' });
+  }
+});
+
+// ── Admin Notifications ─────────────────────
+app.get('/api/admin/notifications', adminAuth, (req, res) => {
+  res.json({
+    notifications: adminNotifications.slice(0, 100),
+    unread: adminNotifications.filter(n => !n.read).length,
+  });
+});
+
+app.post('/api/admin/notifications/read', adminAuth, (req, res) => {
+  const { id } = req.body || {};
+  if (id) {
+    const n = adminNotifications.find(x => x.id === id);
+    if (n) n.read = true;
+  } else {
+    adminNotifications.forEach(n => { n.read = true; });
+  }
+  res.json({ success: true });
+});
+
+app.delete('/api/admin/notifications', adminAuth, (req, res) => {
+  adminNotifications.length = 0;
+  res.json({ success: true });
+});
+
+// ── Marketer Warning System ─────────────────
+const marketerWarnings = new Map(); // tenantId -> { message, expiresAt }
+
+app.post('/api/admin/warn-marketer/:id', adminAuth, (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid marketer ID' });
+  const message = (req.body.message || '').trim();
+  if (!message) return res.status(400).json({ error: 'Warning message is required' });
+  marketerWarnings.set(id, { message, expiresAt: Date.now() + 60000 });
+  pushAdminNotif('warn', `Admin sent warning to marketer #${id}: "${message.substring(0, 80)}"`, id, null);
+  res.json({ success: true });
+});
+
+// Tenant-side: poll for active warning (called from marketer's CRM every 5s)
+app.get('/api/warn-check', tenantAuth, (req, res) => {
+  const w = marketerWarnings.get(req.tenantId);
+  if (w && Date.now() < w.expiresAt) {
+    const remaining_seconds = Math.ceil((w.expiresAt - Date.now()) / 1000);
+    return res.json({ warned: true, message: w.message, remaining_seconds });
+  }
+  // Clean up expired entry
+  if (w) marketerWarnings.delete(req.tenantId);
+  res.json({ warned: false });
+});
+
 // ══════════════════════════════════════════════
 // TENANT API ROUTES (all scoped by tenant_id)
 // ══════════════════════════════════════════════
@@ -1320,6 +1457,31 @@ app.post('/api/send-reply', tenantAuth, sendLimiter, async (req, res) => {
         .update({ last_message_at: now })
         .eq('tenant_id', req.tenantId).eq('phone', cleanedPhone)
     ]);
+
+    // Non-blocking copy-paste detection
+    setImmediate(async () => {
+      try {
+        const oneHourAgo = new Date(Date.now() - 3600000).toISOString();
+        const { data: sameMsg } = await supabase.from('conversations')
+          .select('phone').eq('tenant_id', req.tenantId).eq('direction', 'outgoing')
+          .eq('message', message).gte('created_at', oneHourAgo);
+        const uniquePhones = new Set((sameMsg || []).map(r => r.phone));
+        if (uniquePhones.size >= 3) {
+          const alreadyNotified = adminNotifications.some(n =>
+            n.type === 'copy_paste' && n.tenant_id === req.tenantId &&
+            (Date.now() - new Date(n.timestamp).getTime()) < 900000
+          );
+          if (!alreadyNotified) {
+            const { data: td } = await supabase.from('tenants').select('name').eq('id', req.tenantId).maybeSingle();
+            const tname = td?.name || `Marketer #${req.tenantId}`;
+            pushAdminNotif('copy_paste',
+              `"${tname}" sent identical message to ${uniquePhones.size} different contacts in the last hour. Message: "${message.substring(0, 50)}${message.length > 50 ? '...' : ''}"`,
+              req.tenantId, tname
+            );
+          }
+        }
+      } catch (_) { /* silent */ }
+    });
 
     res.json({ success: true, phone: cleanedPhone, timestamp: now });
   } catch (err) {

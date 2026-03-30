@@ -17,7 +17,7 @@ function toggleTheme() {
 // ── Auth Check ──────────────────────────────
 (async function checkAuth() {
   try {
-    const res = await fetch('/api/auth/check');
+    const res = await fetch('/api/auth/check?role=admin');
     const data = await res.json();
     if (!data.authenticated || data.role !== 'admin') {
       window.location.href = '/login';
@@ -33,9 +33,13 @@ function toggleTheme() {
 loadTenants();
 loadStats();
 loadStorageStats();
+loadDashboard();
+checkNotifBadge();
 setInterval(loadTenants, 8000);
 setInterval(loadStats, 15000);
 setInterval(loadStorageStats, 30000);
+setInterval(loadDashboard, 30000);
+setInterval(checkNotifBadge, 20000);
 
 // ── API Helpers ─────────────────────────────
 async function api(url, opts = {}) {
@@ -146,7 +150,7 @@ function renderTenantRows(list) {
         </td>
         <td class="px-5 py-3.5">${statusBadge}</td>
         <td class="px-5 py-3.5">${waStatus}</td>
-        <td class="px-5 py-3.5 hide-mobile" id="tenant-stats-${t.id}">
+        <td class="px-5 py-3.5 hide-mobile whitespace-nowrap" id="tenant-stats-${t.id}">
           <span class="text-xs dark:text-gray-600 text-gray-400">-</span>
         </td>
         <td class="px-5 py-3.5">
@@ -157,6 +161,7 @@ function renderTenantRows(list) {
               : `<button class="btn-sm btn-connect" onclick="openWAConfigModal(${t.id}, '${escapeHtml(t.name)}')">Configure API</button>`
             }
             <button class="btn-sm btn-edit" onclick="openEditModal(${t.id})">Edit</button>
+            <button class="btn-sm" style="background:rgba(239,68,68,0.12);color:#ef4444;border:none;cursor:pointer" onclick="openWarnModal(${t.id}, '${escapeHtml(t.name)}')">⚠️ Warn</button>
             <button class="btn-sm btn-delete" onclick="openDeleteModal(${t.id}, '${escapeHtml(t.name)}')">Delete</button>
           </div>
         </td>
@@ -778,9 +783,252 @@ async function cleanupOrphans() {
   }
 }
 
+// ── Tab System ──────────────────────────────
+function showTab(name) {
+  ['overview', 'marketers', 'notifications'].forEach(t => {
+    document.getElementById(`tab-${t}`).classList.add('hidden');
+    document.getElementById(`tab-btn-${t}`).classList.remove('tab-active');
+  });
+  document.getElementById(`tab-${name}`).classList.remove('hidden');
+  document.getElementById(`tab-btn-${name}`).classList.add('tab-active');
+  if (name === 'overview') loadDashboard();
+  if (name === 'notifications') loadNotifications();
+}
+
+// ── Dashboard / Overview Tab ─────────────
+async function loadDashboard() {
+  try {
+    const data = await api('/api/admin/marketer-dashboard');
+    document.getElementById('dash-msgs-today').textContent = data.total_messages_today;
+    document.getElementById('dash-msgs-week').textContent = data.total_messages_week;
+    document.getElementById('dash-cp-alerts').textContent = data.copy_paste_alerts;
+
+    const grid = document.getElementById('dash-marketer-grid');
+    if (!data.marketers || !data.marketers.length) {
+      grid.innerHTML = '<div class="card p-8 text-center" style="grid-column:1/-1"><p class="text-sm dark:text-gray-500 text-gray-400">No marketers yet. Add a marketer to see performance data.</p></div>';
+      return;
+    }
+    grid.innerHTML = data.marketers.map((m, i) => renderMarketerCard(m, i)).join('');
+  } catch (err) {
+    console.error('Dashboard load error:', err);
+    document.getElementById('dash-marketer-grid').innerHTML =
+      '<div class="card p-8 text-center" style="grid-column:1/-1"><p class="text-sm text-red-500">Failed to load dashboard. Will retry shortly.</p></div>';
+  }
+}
+
+function renderMarketerCard(m, idx) {
+  const avatarClass = `avatar-grad-${idx % 6}`;
+  const waStatusBadge = m.wa_status === 'connected'
+    ? '<span class="badge badge-connected"><span class="dot dot-green"></span> Connected</span>'
+    : '<span class="badge badge-disconnected"><span class="dot dot-red"></span> Not Set</span>';
+  const activeBadge = m.is_active
+    ? '<span class="badge badge-active"><span class="dot dot-green"></span> Active</span>'
+    : '<span class="badge badge-inactive">Inactive</span>';
+
+  // 7-day bar chart
+  const chart = m.stats.weekly_chart || [0, 0, 0, 0, 0, 0, 0];
+  const maxVal = Math.max(...chart, 1);
+  const dayLabels = Array.from({ length: 7 }, (_, i) => {
+    const d = new Date();
+    d.setDate(d.getDate() - (6 - i));
+    return d.toLocaleDateString('en', { weekday: 'short' });
+  });
+  const barsHtml = chart.map((val, i) => {
+    const h = Math.max(Math.round((val / maxVal) * 44), 3);
+    const isToday = i === 6;
+    return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:1px">
+      <span style="font-size:8px;color:#6b7280;min-height:10px">${val > 0 ? val : ''}</span>
+      <div class="chart-bar${isToday ? ' chart-bar-today' : ''}" style="width:100%;height:${h}px" title="${dayLabels[i]}: ${val} msgs"></div>
+      <span style="font-size:8px;color:#6b7280">${dayLabels[i].substring(0, 2)}</span>
+    </div>`;
+  }).join('');
+
+  const cpWarnHtml = m.copy_paste_warning ? `
+    <div style="margin-top:10px;padding:8px 10px;border-radius:10px;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.25)">
+      <p style="font-size:11px;color:#f59e0b;font-weight:700">⚠️ Copy-Paste Alert</p>
+      <p style="font-size:10px;color:#9ca3af;margin-top:2px">Same message sent to <strong style="color:#fbbf24">${m.copy_paste_max}</strong> different contacts in the last hour.</p>
+    </div>` : '';
+
+  return `<div class="card p-4${m.copy_paste_warning ? ' dark:border-amber-500/20 border-amber-300/60' : ''}">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div class="w-10 h-10 rounded-xl ${avatarClass} flex items-center justify-center text-sm font-bold text-white flex-shrink-0">
+          ${m.name.charAt(0).toUpperCase()}
+        </div>
+        <div>
+          <p class="text-sm font-bold dark:text-white text-gray-900">${escapeHtml(m.name)}</p>
+          <p class="text-[10px] font-mono dark:text-gray-500 text-gray-400">${escapeHtml(m.username)}</p>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px;align-items:flex-end">
+        ${activeBadge}
+        ${waStatusBadge}
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-bottom:12px">
+      <div class="dark:bg-white/[0.03] bg-gray-50 rounded-lg p-1.5 text-center">
+        <p class="text-sm font-extrabold dark:text-white text-gray-900">${formatNum(m.stats.total_leads)}</p>
+        <p class="text-[9px] dark:text-gray-500 text-gray-400">Leads</p>
+      </div>
+      <div class="dark:bg-white/[0.03] bg-gray-50 rounded-lg p-1.5 text-center">
+        <p class="text-sm font-extrabold text-green-500">${m.stats.messages_today}</p>
+        <p class="text-[9px] dark:text-gray-500 text-gray-400">Sent Today</p>
+      </div>
+      <div class="dark:bg-white/[0.03] bg-gray-50 rounded-lg p-1.5 text-center">
+        <p class="text-sm font-extrabold text-blue-500">${m.stats.incoming_today}</p>
+        <p class="text-[9px] dark:text-gray-500 text-gray-400">Recv Today</p>
+      </div>
+      <div class="dark:bg-white/[0.03] bg-gray-50 rounded-lg p-1.5 text-center">
+        <p class="text-sm font-extrabold text-purple-500">${m.stats.messages_week}</p>
+        <p class="text-[9px] dark:text-gray-500 text-gray-400">This Week</p>
+      </div>
+    </div>
+    <div>
+      <p class="text-[9px] font-bold uppercase tracking-widest dark:text-gray-600 text-gray-400 mb-1.5">7-Day Activity</p>
+      <div style="display:flex;align-items:flex-end;gap:3px;height:60px">${barsHtml}</div>
+    </div>
+    ${cpWarnHtml}
+    <div style="margin-top:12px;padding-top:10px;border-top:1px solid rgba(239,68,68,0.12)">
+      <button class="btn-sm btn-disconnect w-full justify-center" style="width:100%;display:flex;align-items:center;gap:5px;" onclick="openWarnModal(${m.id}, '${escapeHtml(m.name).replace(/'/g, "\\'")}')">
+        <svg style="width:12px;height:12px;flex-shrink:0" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+        Send Warning
+      </button>
+    </div>
+  </div>`;
+}
+
+// ── Marketer Warning ─────────────────────
+let warnTargetId = null;
+const DEFAULT_WARNING = "⚠️ WARNING: Stop spamming immediately. If you continue, your WhatsApp API access will be banned. This is your final warning — act strictly!";
+
+function openWarnModal(id, name) {
+  warnTargetId = id;
+  document.getElementById('warn-marketer-name').textContent = name;
+  document.getElementById('warn-msg-input').value = DEFAULT_WARNING;
+  document.getElementById('modal-warn').classList.remove('hidden');
+}
+
+async function sendWarning() {
+  if (!warnTargetId) return;
+  const message = document.getElementById('warn-msg-input').value.trim();
+  if (!message) { toast('Warning message cannot be empty', 'error'); return; }
+  const btn = document.getElementById('warn-send-btn');
+  btn.disabled = true;
+  btn.textContent = 'Sending...';
+  try {
+    await api(`/api/admin/warn-marketer/${warnTargetId}`, {
+      method: 'POST',
+      body: JSON.stringify({ message })
+    });
+    toast(`Warning sent — their CRM will freeze for 10 seconds`, 'success');
+    closeModal('modal-warn');
+    warnTargetId = null;
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Send Warning';
+  }
+}
+
+// ── Notifications Tab ────────────────────
+async function checkNotifBadge() {
+  try {
+    const data = await api('/api/admin/notifications');
+    updateNotifBadge(data.unread);
+  } catch (_) {}
+}
+
+async function loadNotifications() {
+  try {
+    const data = await api('/api/admin/notifications');
+    updateNotifBadge(data.unread);
+    renderNotifications(data.notifications);
+    if (data.unread > 0) {
+      await api('/api/admin/notifications/read', { method: 'POST', body: JSON.stringify({}) });
+      updateNotifBadge(0);
+    }
+  } catch (err) {
+    console.error('Notifications error:', err);
+  }
+}
+
+function updateNotifBadge(count) {
+  const badge = document.getElementById('notif-badge');
+  const tabBadge = document.getElementById('notif-tab-badge');
+  if (count > 0) {
+    const label = count > 99 ? '99+' : String(count);
+    badge.textContent = label;
+    badge.classList.remove('hidden');
+    tabBadge.textContent = label;
+    tabBadge.classList.remove('hidden');
+  } else {
+    badge.classList.add('hidden');
+    tabBadge.classList.add('hidden');
+  }
+}
+
+function renderNotifications(list) {
+  const el = document.getElementById('notif-list');
+  if (!list || !list.length) {
+    el.innerHTML = '<div class="py-12 text-center"><p class="text-sm dark:text-gray-500 text-gray-400">No notifications yet. Alerts will appear here automatically.</p></div>';
+    return;
+  }
+  const iconMap = {
+    copy_paste: `<svg class="w-5 h-5 text-amber-500 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"/></svg>`,
+    error: `<svg class="w-5 h-5 text-red-500 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>`,
+    warn: `<svg class="w-5 h-5 text-amber-500 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>`,
+    info: `<svg class="w-5 h-5 text-blue-500 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>`,
+  };
+  const labelMap = { copy_paste: 'Copy-Paste Detected', error: 'Error', warn: 'Warning', info: 'Info' };
+  el.innerHTML = list.map(n => {
+    const timeStr = formatNotifTime(new Date(n.timestamp));
+    return `<div class="notif-item${n.read ? '' : ' notif-unread'}">
+      <div class="notif-dot"></div>
+      <div style="width:22px;flex-shrink:0;padding-top:1px">${iconMap[n.type] || iconMap.info}</div>
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+          <p class="text-xs font-bold dark:text-gray-200 text-gray-700">${labelMap[n.type] || n.type}${n.tenant_name ? ` — ${escapeHtml(n.tenant_name)}` : ''}</p>
+          <span class="text-[10px] dark:text-gray-600 text-gray-400 flex-shrink-0">${timeStr}</span>
+        </div>
+        <p class="text-xs dark:text-gray-400 text-gray-600 mt-0.5" style="line-height:1.5">${escapeHtml(n.message)}</p>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function formatNotifTime(date) {
+  const diff = Date.now() - date.getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return date.toLocaleDateString();
+}
+
+async function markAllNotifRead() {
+  try {
+    await api('/api/admin/notifications/read', { method: 'POST', body: JSON.stringify({}) });
+    updateNotifBadge(0);
+    document.querySelectorAll('.notif-item.notif-unread').forEach(el => el.classList.remove('notif-unread'));
+    toast('All notifications marked as read', 'success');
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+async function clearAllNotifs() {
+  if (!confirm('Clear all notifications?')) return;
+  try {
+    await api('/api/admin/notifications', { method: 'DELETE' });
+    renderNotifications([]);
+    updateNotifBadge(0);
+    toast('Notifications cleared', 'success');
+  } catch (err) { toast(err.message, 'error'); }
+}
+
 // ── Logout ──────────────────────────────────
 async function logout() {
-  await fetch('/api/auth/logout', { method: 'POST' });
+  await fetch('/api/auth/logout?role=admin', { method: 'POST' });
   window.location.href = '/login';
 }
 
