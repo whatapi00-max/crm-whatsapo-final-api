@@ -523,8 +523,10 @@ const globalSchedulerInterval = setInterval(async () => {
 }, 60000); // 60 s — replaces N×30s per-tenant intervals
 
 // ── Initialize All Active Tenants ───────────
-async function initAllTenants(retries = 3) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
+async function initAllTenants() {
+  let attempt = 0;
+  while (true) {
+    attempt++;
     try {
       const { data: tenants, error: tenantsErr } = await supabase.from('tenants').select('id, name').eq('is_active', true);
       if (tenantsErr) throw tenantsErr;
@@ -542,11 +544,10 @@ async function initAllTenants(retries = 3) {
       }
       return; // success
     } catch (err) {
-      if (!isAbortError(err)) console.error(`❌ Failed to load tenants (attempt ${attempt}/${retries}):`, err.message);
-      if (attempt < retries) await delay(2000);
+      if (!isAbortError(err)) console.warn(`⚠️  Supabase not ready (attempt ${attempt}), retrying in 10s...`);
+      await delay(10000);
     }
   }
-  console.warn('⚠️  Could not pre-load tenants on startup. Configs will lazy-load on first request.');
 }
 
 // ══════════════════════════════════════════════
