@@ -761,11 +761,13 @@ const sendLimiter = rateLimit({
   standardHeaders: true, legacyHeaders: false
 });
 
-// General API limiter for all tenant endpoints (prevents any single source from overwhelming)
+// General API limiter — raised to 600/min per IP so 100 marketers behind a single NAT
+// (office/datacenter) don't trip each other's limits (each polls ~3–4 req/30s)
 const apiLimiter = rateLimit({
-  windowMs: 60000, max: 200,
+  windowMs: 60000, max: 600,
   message: { error: 'Too many requests, please slow down' },
-  standardHeaders: true, legacyHeaders: false
+  standardHeaders: true, legacyHeaders: false,
+  skip: (req) => !!req.tenantId // skip if already tenant-auth'd (auth already a gate)
 });
 
 // ── Auth Middleware ──────────────────────────
@@ -1347,6 +1349,10 @@ app.get('/api/admin/storage', adminAuth, async (req, res) => {
 // ── Per-Tenant Storage Breakdown ────────────
 app.get('/api/admin/storage/tenants', adminAuth, async (req, res) => {
   try {
+    const cacheKey = 'admin_storage_tenants';
+    const cached = getCachedResponse(cacheKey);
+    if (cached) return res.json(cached);
+
     const { data: allTenants } = await supabase.from('tenants').select('id, name, username');
     if (!allTenants) return res.json([]);
 
@@ -1374,6 +1380,7 @@ app.get('/api/admin/storage/tenants', adminAuth, async (req, res) => {
     }));
 
     breakdown.sort((a, b) => b.total_rows - a.total_rows);
+    setCachedResponse(cacheKey, breakdown, 60000); // 60s cache
     res.json(breakdown);
   } catch (err) {
     console.error('Tenant storage breakdown error:', err.message);
@@ -2280,24 +2287,45 @@ app.post('/api/leads/import', tenantAuth, async (req, res) => {
       return res.status(400).json({ error: 'No contacts provided' });
     }
 
-    let imported = 0, skipped = 0;
-    for (const contact of contacts.slice(0, 500)) {
-      try {
-        const phone = String(contact.phone || '').replace(/\D/g, '');
-        if (!phone || phone.length < 7) { skipped++; continue; }
+    // Build deduplicated candidate list from input (in-memory, zero DB cost)
+    const phonesSeen = new Set();
+    const candidates = [];
+    for (const c of contacts.slice(0, 500)) {
+      const phone = String(c.phone || '').replace(/\D/g, '');
+      if (!phone || phone.length < 7 || phonesSeen.has(phone)) continue;
+      phonesSeen.add(phone);
+      candidates.push({
+        phone,
+        real_phone: String(c.phone || '').trim(),
+        name: String(c.name || 'Unknown').substring(0, 100)
+      });
+    }
 
-        const { data: existing } = await supabase.from('leads')
-          .select('id').eq('tenant_id', req.tenantId).eq('phone', phone).maybeSingle();
-        if (existing) { skipped++; continue; }
+    let imported = 0;
+    let skipped = contacts.length - candidates.length; // invalid / duplicate entries
 
-        await supabase.from('leads').insert({
-          tenant_id: req.tenantId, phone,
-          real_phone: String(contact.phone || '').trim(),
-          name: String(contact.name || 'Unknown').substring(0, 100),
-          source: 'import', status: 'new', tags: []
-        });
-        imported++;
-      } catch (e) { skipped++; }
+    if (candidates.length > 0) {
+      // ONE query to find all already-existing phones (replaces N individual checks)
+      const { data: existing } = await supabase.from('leads')
+        .select('phone').eq('tenant_id', req.tenantId)
+        .in('phone', candidates.map(c => c.phone));
+      const existingSet = new Set((existing || []).map(e => e.phone));
+
+      const toInsert = candidates
+        .filter(c => !existingSet.has(c.phone))
+        .map(c => ({
+          tenant_id: req.tenantId, phone: c.phone, real_phone: c.real_phone,
+          name: c.name, source: 'import', status: 'new', tags: []
+        }));
+      skipped += candidates.length - toInsert.length;
+
+      // Batch insert in chunks of 100 (Supabase row limit per request)
+      for (let i = 0; i < toInsert.length; i += 100) {
+        const chunk = toInsert.slice(i, i + 100);
+        const { error } = await supabase.from('leads').insert(chunk);
+        if (!error) imported += chunk.length;
+        else skipped += chunk.length;
+      }
     }
 
     res.json({ success: true, imported, skipped, total: contacts.length });
@@ -2345,23 +2373,25 @@ app.get('/api/active-chats', tenantAuth, async (req, res) => {
 
     const phones = leads.map(l => l.phone);
 
-    // Batch: get last message for all leads in ONE query using RPC or multiple-filter
-    // We'll get recent conversations and group by phone in JS
+    // Batch: get last message for all leads in ONE query — group by phone in JS
+    // Use 5× lead count (min 600) so busy chats don't push out quieter ones
     const { data: recentMsgs, error: msgErr } = await supabase.from('conversations')
       .select('phone, message, direction, created_at')
       .eq('tenant_id', tid)
       .in('phone', phones)
       .order('created_at', { ascending: false })
-      .limit(phones.length * 2); // 2x to ensure at least 1 per phone
+      .limit(Math.max(phones.length * 5, 600));
     if (msgErr) console.error('⚠️  Active chats recentMsgs error:', msgErr.message);
 
     // Batch: get unread counts for all phones in ONE query
+    // Limit to 2000 to prevent runaway scans on tenants with large unread backlogs
     const { data: unreadRows, error: unreadErr } = await supabase.from('conversations')
       .select('phone')
       .eq('tenant_id', tid)
       .in('phone', phones)
       .eq('direction', 'incoming')
-      .eq('status', 'received');
+      .eq('status', 'received')
+      .limit(2000);
     if (unreadErr) console.error('⚠️  Active chats unreadRows error:', unreadErr.message);
 
     // Build lookup maps
@@ -2477,7 +2507,7 @@ app.get('*', (req, res) => {
 // ══════════════════════════════════════════════
 // START SERVER
 // ══════════════════════════════════════════════
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log('');
   console.log('╔══════════════════════════════════════════════════╗');
   console.log('║   Billy777 WhatsApp CRM - Cloud API Edition      ║');
@@ -2491,6 +2521,12 @@ app.listen(PORT, () => {
 
   initAllTenants();
 });
+
+// Critical for 100+ concurrent users on Render/nginx:
+// Node.js default keep-alive is 5s but Render LB timeout is 75s — mismatch causes
+// ECONNRESET errors under load. Set keep-alive > LB timeout so LB always closes first.
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
 
 // ── Process-Level Error Handlers ────────────
 process.on('uncaughtException', (err) => {
@@ -2508,13 +2544,20 @@ process.on('unhandledRejection', (reason, promise) => {
 process.on('SIGINT', async () => {
   console.log('\n🛑 Shutting down gracefully...');
   clearInterval(globalSchedulerInterval);
-  waManager.destroyAll();
-  process.exit(0);
+  server.close(() => {
+    waManager.destroyAll();
+    process.exit(0);
+  });
+  // Force-exit if still open after 10s
+  setTimeout(() => process.exit(0), 10000).unref();
 });
 
 process.on('SIGTERM', async () => {
   console.log('\n🛑 SIGTERM received, shutting down...');
   clearInterval(globalSchedulerInterval);
-  waManager.destroyAll();
-  process.exit(0);
+  server.close(() => {
+    waManager.destroyAll();
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(0), 10000).unref();
 });
