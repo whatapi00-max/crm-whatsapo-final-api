@@ -52,10 +52,10 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
 }
 
 // ── Supabase Client ─────────────────────────
-// Custom fetch with 10s timeout to prevent hanging on Supabase outages / free-tier pauses
+// Custom fetch with 55s timeout to allow Supabase free-tier wake-up (paused DB can take up to 60s)
 const supabaseFetch = async (url, options = {}) => {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10000);
+  const timeoutId = setTimeout(() => controller.abort(), 55000);
   try {
     return await fetch(url, { ...options, signal: controller.signal });
   } finally {
@@ -81,6 +81,12 @@ function cleanPhone(raw) {
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Cookie options — use Secure+SameSite=None only when request came in over HTTPS
+function cookieOpts(req, maxAgeMs) {
+  const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  return { httpOnly: true, secure: isHttps, sameSite: isHttps ? 'none' : 'lax', maxAge: maxAgeMs };
 }
 
 const processedMsgIds = new Map(); // tenantId -> Set
@@ -523,7 +529,12 @@ const globalSchedulerInterval = setInterval(async () => {
 }, 60000); // 60 s — replaces N×30s per-tenant intervals
 
 // ── Initialize All Active Tenants ───────────
+let _initRunning = false;
 async function initAllTenants() {
+  if (_initRunning) return; // prevent stacking parallel retries
+  _initRunning = true;
+  let wait = 15000; // start at 15s
+  const maxWait = 300000; // cap at 5 minutes
   let attempt = 0;
   while (true) {
     attempt++;
@@ -532,6 +543,7 @@ async function initAllTenants() {
       if (tenantsErr) throw tenantsErr;
       if (!tenants || tenants.length === 0) {
         console.log('ℹ️  No active tenants found. Create one via admin dashboard.');
+        _initRunning = false;
         return;
       }
       console.log(`🚀 Loading Cloud API configs for ${tenants.length} tenants...`);
@@ -542,10 +554,13 @@ async function initAllTenants() {
           console.error(`❌ Failed to load config for tenant ${tenant.id} (${tenant.name}):`, err.message);
         }
       }
+      _initRunning = false;
       return; // success
     } catch (err) {
-      if (!isAbortError(err)) console.warn(`⚠️  Supabase not ready (attempt ${attempt}), retrying in 10s...`);
-      await delay(10000);
+      const msg = isAbortError(err) ? 'timeout' : err.message;
+      console.warn(`⚠️  Supabase not ready (attempt ${attempt}, ${msg}), retrying in ${wait / 1000}s...`);
+      await delay(wait);
+      wait = Math.min(wait * 2, maxWait); // exponential backoff: 15s, 30s, 60s, 120s, 300s...
     }
   }
 }
@@ -833,10 +848,7 @@ async function tenantAuth(req, res, next) {
       tenant_id: decoded.tenant_id, username: decoded.username,
       name: decoded.name, role: 'tenant'
     }, JWT_SECRET, { expiresIn: '30m' });
-    res.cookie(cookieName, newToken, {
-      httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-      maxAge: 30 * 60 * 1000
-    });
+    res.cookie(cookieName, newToken, cookieOpts(req, 30 * 60 * 1000));
   }
 
   next();
@@ -918,10 +930,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
       name: tenant.name, role: 'tenant'
     }, JWT_SECRET, { expiresIn: '30m' });
 
-    res.cookie(`crm_token_${tenant.id}`, token, {
-      httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-      maxAge: 30 * 60 * 1000
-    });
+    res.cookie(`crm_token_${tenant.id}`, token, cookieOpts(req, 30 * 60 * 1000));
 
     res.json({
       success: true, role: 'tenant',
@@ -946,10 +955,7 @@ app.post('/api/auth/admin-login', loginLimiter, async (req, res) => {
 
     const token = jwt.sign({ role: 'admin', username: ADMIN_USERNAME }, JWT_SECRET, { expiresIn: '24h' });
 
-    res.cookie('crm_admin_token', token, {
-      httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-      maxAge: 24 * 60 * 60 * 1000
-    });
+    res.cookie('crm_admin_token', token, cookieOpts(req, 24 * 60 * 60 * 1000));
 
     res.json({ success: true, role: 'admin', user: { username: ADMIN_USERNAME } });
   } catch (err) {
@@ -1026,6 +1032,7 @@ app.get('/api/admin/tenants', adminAuth, async (req, res) => {
     setCachedResponse(cacheKey, tenants, 30000);
     res.json(tenants);
   } catch (err) {
+    console.error('Failed to fetch tenants:', err.message);
     res.status(500).json({ error: 'Failed to fetch tenants' });
   }
 });
@@ -2390,13 +2397,6 @@ app.listen(PORT, () => {
   console.log('');
 
   initAllTenants();
-
-  // Keep Supabase project alive (free tier pauses after ~7 days of inactivity)
-  setInterval(async () => {
-    try {
-      await supabase.from('tenants').select('id', { count: 'exact', head: true });
-    } catch (_) {}
-  }, 20 * 60 * 1000); // every 20 minutes (sufficient to prevent free-tier pause)
 });
 
 // ── Graceful Shutdown ───────────────────────
