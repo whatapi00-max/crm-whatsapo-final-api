@@ -35,11 +35,11 @@ loadStats();
 loadStorageStats();
 loadDashboard();
 checkNotifBadge();
-setInterval(loadTenants, 8000);
-setInterval(loadStats, 15000);
-setInterval(loadStorageStats, 30000);
-setInterval(loadDashboard, 30000);
-setInterval(checkNotifBadge, 20000);
+setInterval(loadTenants, 45000);
+setInterval(loadStats, 60000);
+setInterval(loadStorageStats, 120000);
+setInterval(loadDashboard, 90000);
+setInterval(checkNotifBadge, 60000);
 
 // ── API Helpers ─────────────────────────────
 async function api(url, opts = {}) {

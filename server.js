@@ -993,6 +993,10 @@ app.get('/api/auth/check', async (req, res) => {
 // ── List Tenants ────────────────────────────
 app.get('/api/admin/tenants', adminAuth, async (req, res) => {
   try {
+    const cacheKey = 'admin_tenants';
+    const cached = getCachedResponse(cacheKey);
+    if (cached) return res.json(cached);
+
     const { data, error } = await supabase.from('tenants')
       .select('id, username, unique_key, name, is_active, created_at, updated_at, wa_phone_number_id')
       .order('created_at', { ascending: false });
@@ -1004,6 +1008,7 @@ app.get('/api/admin/tenants', adminAuth, async (req, res) => {
       wa_configured: !!(t.wa_phone_number_id)
     }));
 
+    setCachedResponse(cacheKey, tenants, 30000);
     res.json(tenants);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch tenants' });
@@ -1163,6 +1168,10 @@ app.post('/api/admin/tenants/:id/disconnect-wa', adminAuth, async (req, res) => 
 // ── Admin Stats ─────────────────────────────
 app.get('/api/admin/stats', adminAuth, async (req, res) => {
   try {
+    const cacheKey = 'admin_stats';
+    const cached = getCachedResponse(cacheKey);
+    if (cached) return res.json(cached);
+
     const [tenantsRes, leadsRes, msgsRes] = await Promise.all([
       supabase.from('tenants').select('id', { count: 'exact', head: true }),
       supabase.from('leads').select('id', { count: 'exact', head: true }),
@@ -1170,11 +1179,13 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
         .gte('created_at', new Date(Date.now() - 86400000).toISOString())
     ]);
 
-    res.json({
+    const result = {
       total_tenants: tenantsRes.count || 0,
       total_leads: leadsRes.count || 0,
       messages_today: msgsRes.count || 0
-    });
+    };
+    setCachedResponse(cacheKey, result, 60000);
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch admin stats' });
   }
@@ -1198,6 +1209,9 @@ app.get('/api/admin/tenants/:id/stats', adminAuth, async (req, res) => {
 // ── Storage Stats (Admin) ───────────────────
 app.get('/api/admin/storage', adminAuth, async (req, res) => {
   try {
+    const cacheKey = 'admin_storage';
+    const cached = getCachedResponse(cacheKey);
+    if (cached) return res.json(cached);
     const memUsage = process.memoryUsage();
     const ramUsedMB = Math.round(memUsage.rss / 1024 / 1024);
     const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
@@ -1231,7 +1245,7 @@ app.get('/api/admin/storage', adminAuth, async (req, res) => {
     const ramLimitMB = parseInt(process.env.RAM_LIMIT_MB) || Math.round(os.totalmem() / (1024 * 1024));
     const dbLimitMB = parseInt(process.env.DB_LIMIT_MB) || 500;
 
-    res.json({
+    const storageResult = {
       disk: { used_bytes: 0, used_mb: 0, limit_mb: 0, percent: 0 },
       ram: {
         rss_mb: ramUsedMB, heap_used_mb: heapUsedMB, heap_total_mb: heapTotalMB,
@@ -1245,7 +1259,9 @@ app.get('/api/admin/storage', adminAuth, async (req, res) => {
         percent: Math.min(100, Math.round((estimatedDbSizeMB / dbLimitMB) * 100)),
       },
       uptime_seconds: Math.floor(process.uptime()),
-    });
+    };
+    setCachedResponse('admin_storage', storageResult, 60000);
+    res.json(storageResult);
   } catch (err) {
     console.error('Storage stats error:', err.message);
     res.status(500).json({ error: 'Failed to fetch storage stats' });
@@ -1313,6 +1329,10 @@ app.post('/api/admin/storage/cleanup-orphans', adminAuth, async (req, res) => {
 // ── Marketer Performance Dashboard ─────────
 app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
   try {
+    const cacheKey = 'admin_dashboard';
+    const cached = getCachedResponse(cacheKey);
+    if (cached) return res.json(cached);
+
     const { data: allTenants, error } = await supabase.from('tenants')
       .select('id, name, username, is_active')
       .order('name', { ascending: true });
@@ -1320,10 +1340,10 @@ app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
 
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
     const oneDayAgo = new Date(Date.now() - 86400000).toISOString();
-    const oneHourAgo = new Date(Date.now() - 3600000).toISOString();
 
+    // Run all tenant queries in parallel but only 4 queries each (removed hourData — uses in-memory cpTracker)
     const marketers = await Promise.all((allTenants || []).map(async (t) => {
-      const [leadsRes, msgsToday, weekData, incomingToday, hourData] = await Promise.all([
+      const [leadsRes, msgsToday, weekData, incomingToday] = await Promise.all([
         supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', t.id),
         supabase.from('conversations').select('id', { count: 'exact', head: true })
           .eq('tenant_id', t.id).eq('direction', 'outgoing').gte('created_at', oneDayAgo),
@@ -1331,8 +1351,6 @@ app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
           .eq('tenant_id', t.id).eq('direction', 'outgoing').gte('created_at', sevenDaysAgo),
         supabase.from('conversations').select('id', { count: 'exact', head: true })
           .eq('tenant_id', t.id).eq('direction', 'incoming').gte('created_at', oneDayAgo),
-        supabase.from('conversations').select('message, phone')
-          .eq('tenant_id', t.id).eq('direction', 'outgoing').gte('created_at', oneHourAgo),
       ]);
 
       // Build 7-day chart: index 6 = today, index 0 = 6 days ago
@@ -1343,17 +1361,14 @@ app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
         if (d >= 0 && d < 7) chart[6 - d]++;
       });
 
-      // Copy-paste: same message body sent to 3+ different phones in last hour
-      const byMsg = {};
-      (hourData.data || []).forEach(row => {
-        const k = (row.message || '').trim();
-        if (k.length < 5) return;
-        if (!byMsg[k]) byMsg[k] = new Set();
-        byMsg[k].add(row.phone);
-      });
-      const cpSets = Object.values(byMsg).filter(s => s.size >= 3);
-      const copyPasteWarn = cpSets.length > 0;
-      const copyPasteMax = copyPasteWarn ? Math.max(...cpSets.map(s => s.size)) : 0;
+      // Copy-paste detection from in-memory tracker (zero DB cost)
+      let copyPasteMax = 0;
+      for (const [key, entry] of cpTracker) {
+        if (!key.startsWith(`${t.id}:`)) continue;
+        if ((Date.now() - entry.ts) > 3600000) continue;
+        if (entry.phones.size > copyPasteMax) copyPasteMax = entry.phones.size;
+      }
+      const copyPasteWarn = copyPasteMax >= 3;
 
       return {
         id: t.id, name: t.name, username: t.username,
@@ -1370,14 +1385,16 @@ app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
       };
     }));
 
-    res.json({
+    const result = {
       marketers,
       total_messages_today: marketers.reduce((s, m) => s + m.stats.messages_today, 0),
       total_messages_week: marketers.reduce((s, m) => s + m.stats.messages_week, 0),
       copy_paste_alerts: marketers.filter(m => m.copy_paste_warning).length,
-    });
+    };
+    setCachedResponse(cacheKey, result, 60000); // 60s cache
+    res.json(result);
   } catch (err) {
-    console.error('Dashboard error:', err.message);
+    if (err.name !== 'AbortError') console.error('Dashboard error:', err.message);
     res.status(500).json({ error: 'Failed to fetch dashboard' });
   }
 });
