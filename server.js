@@ -776,7 +776,8 @@ function verifyTenantToken(req) {
     }
   }
   // 3. Legacy fallback: old crm_token cookie
-  return verifyToken(req, 'crm_token');
+  const legacy = verifyToken(req, 'crm_token');
+  return (legacy && legacy.role === 'tenant') ? legacy : null;
 }
 
 // ── Tenant verification cache (avoids DB hit on every API call) ──
