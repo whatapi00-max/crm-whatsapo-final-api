@@ -40,10 +40,32 @@ if (!process.env.WEBHOOK_VERIFY_TOKEN) {
   console.log('⚠️  WEBHOOK_VERIFY_TOKEN not set in .env — using default "billy777_verify"');
 }
 
+// ── Env Validation ───────────────────────────
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
+  console.error('❌ SUPABASE_URL and SUPABASE_KEY environment variables are required!');
+  process.exit(1);
+}
+
 // ── Supabase Client ─────────────────────────
+// Custom fetch with 15s timeout to prevent hanging on Supabase outages / free-tier pauses
+const supabaseFetch = async (url, options = {}) => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+};
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
+  process.env.SUPABASE_KEY,
+  {
+    global: { fetch: supabaseFetch },
+    // Disable Supabase Auth background timers — we use our own JWT system
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
+  }
 );
 
 // ── Helpers ─────────────────────────────────
@@ -92,7 +114,6 @@ function pushAdminNotif(type, message, tenantId, tenantName) {
 class CloudAPIManager {
   constructor() {
     this.configs = new Map(); // tenantId -> { phone_number_id, access_token, waba_id }
-    this.scheduledIntervals = new Map();
   }
 
   getConfig(tenantId) {
@@ -143,7 +164,6 @@ class CloudAPIManager {
         access_token: tenant.wa_access_token,
         waba_id: tenant.wa_waba_id || null
       });
-      this.startScheduledChecker(tenantId);
       console.log(`✅ [Tenant ${tid}] Cloud API config loaded (Phone ID: ${tenant.wa_phone_number_id})`);
       return true;
     }
@@ -169,7 +189,6 @@ class CloudAPIManager {
         access_token: accessToken,
         waba_id: wabaId || null
       });
-      this.startScheduledChecker(tenantId);
     } else {
       this.removeConfig(tenantId);
     }
@@ -177,9 +196,6 @@ class CloudAPIManager {
 
   removeConfig(tenantId) {
     const tid = String(tenantId);
-    const interval = this.scheduledIntervals.get(tid);
-    if (interval) clearInterval(interval);
-    this.scheduledIntervals.delete(tid);
     this.configs.delete(tid);
   }
 
@@ -428,78 +444,101 @@ class CloudAPIManager {
     }
   }
 
-  // ── Scheduled Message Checker ─────────────
-  startScheduledChecker(tenantId) {
-    const tid = String(tenantId);
-    const existing = this.scheduledIntervals.get(tid);
-    if (existing) clearInterval(existing);
-
-    const interval = setInterval(async () => {
-      try {
-        if (!this.isReady(tenantId)) return;
-        const { data: pending } = await supabase.from('scheduled_messages')
-          .select('*').eq('tenant_id', tenantId).eq('status', 'pending')
-          .lte('scheduled_at', new Date().toISOString())
-          .order('scheduled_at', { ascending: true }).limit(10);
-
-        if (!pending || pending.length === 0) return;
-
-        for (const sm of pending) {
-          try {
-            const cleanedPhone = sm.phone.replace(/\D/g, '');
-            await delay(MESSAGE_DELAY_MS);
-            await this.sendMessage(tenantId, cleanedPhone, sm.message);
-            // Store in conversations
-            await supabase.from('conversations').insert({
-              tenant_id: tenantId, phone: cleanedPhone, message: sm.message,
-              direction: 'outgoing', status: 'sent'
-            });
-            await supabase.from('scheduled_messages')
-              .update({ status: 'sent', sent_at: new Date().toISOString() }).eq('id', sm.id);
-            console.log(`⏰ [Tenant ${tid}] Scheduled message sent to ${cleanedPhone}`);
-          } catch (e) {
-            await supabase.from('scheduled_messages')
-              .update({ status: 'failed', error_message: e.message }).eq('id', sm.id);
-          }
-        }
-      } catch (err) {
-        console.error(`⚠️  [Tenant ${tid}] Scheduled checker error:`, err.message);
-      }
-    }, 30000);
-
-    this.scheduledIntervals.set(tid, interval);
-  }
-
   destroyAll() {
-    for (const [tid, interval] of this.scheduledIntervals) {
-      clearInterval(interval);
-    }
-    this.scheduledIntervals.clear();
     this.configs.clear();
   }
 }
 
 const waManager = new CloudAPIManager();
 
-// ── Initialize All Active Tenants ───────────
-async function initAllTenants() {
-  try {
-    const { data: tenants } = await supabase.from('tenants').select('id, name').eq('is_active', true);
-    if (!tenants || tenants.length === 0) {
-      console.log('ℹ️  No active tenants found. Create one via admin dashboard.');
-      return;
+// ── Copy-Paste Tracker (in-memory — avoids a DB scan per outgoing message) ──
+// key: `${tenantId}:${message}` -> { phones: Set<string>, ts: number }
+const cpTracker = new Map();
+
+function trackCopyPaste(tenantId, phone, message) {
+  const msg = (message || '').trim();
+  if (msg.length < 5) return 0;
+  const key = `${tenantId}:${msg}`;
+  let entry = cpTracker.get(key);
+  // Reset entry if it's older than 1 hour
+  if (!entry || (Date.now() - entry.ts) > 3600000) {
+    entry = { phones: new Set(), ts: Date.now() };
+    cpTracker.set(key, entry);
+  }
+  entry.phones.add(phone);
+  // Evict stale entries when map grows large
+  if (cpTracker.size > 1000) {
+    const cutoff = Date.now() - 3600000;
+    for (const [k, v] of cpTracker) {
+      if (v.ts < cutoff) cpTracker.delete(k);
     }
-    console.log(`🚀 Loading Cloud API configs for ${tenants.length} tenants...`);
-    for (const tenant of tenants) {
+  }
+  return entry.phones.size;
+}
+
+// ── Global Scheduled Message Checker ─────────────────────────────────────────
+// Single interval across all tenants: 1 DB query/min instead of N queries/30s
+let schedulerRunning = false;
+const globalSchedulerInterval = setInterval(async () => {
+  if (schedulerRunning) return;
+  schedulerRunning = true;
+  try {
+    const { data: pending } = await supabase.from('scheduled_messages')
+      .select('*').eq('status', 'pending')
+      .lte('scheduled_at', new Date().toISOString())
+      .order('scheduled_at', { ascending: true }).limit(20);
+
+    if (!pending || pending.length === 0) return;
+
+    for (const sm of pending) {
+      if (!waManager.isReady(sm.tenant_id)) continue;
       try {
-        await waManager.loadFromDB(tenant.id);
-      } catch (err) {
-        console.error(`❌ Failed to load config for tenant ${tenant.id} (${tenant.name}):`, err.message);
+        const cleanedPhone = sm.phone.replace(/\D/g, '');
+        await delay(MESSAGE_DELAY_MS);
+        await waManager.sendMessage(sm.tenant_id, cleanedPhone, sm.message);
+        await supabase.from('conversations').insert({
+          tenant_id: sm.tenant_id, phone: cleanedPhone, message: sm.message,
+          direction: 'outgoing', status: 'sent'
+        });
+        await supabase.from('scheduled_messages')
+          .update({ status: 'sent', sent_at: new Date().toISOString() }).eq('id', sm.id);
+        console.log(`⏰ [Tenant ${sm.tenant_id}] Scheduled message sent to ${cleanedPhone}`);
+      } catch (e) {
+        await supabase.from('scheduled_messages')
+          .update({ status: 'failed', error_message: e.message }).eq('id', sm.id);
       }
     }
   } catch (err) {
-    console.error('❌ Failed to load tenants:', err.message);
+    console.error('⚠️  Global scheduler error:', err.message);
+  } finally {
+    schedulerRunning = false;
   }
+}, 60000); // 60 s — replaces N×30s per-tenant intervals
+
+// ── Initialize All Active Tenants ───────────
+async function initAllTenants(retries = 5) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const { data: tenants } = await supabase.from('tenants').select('id, name').eq('is_active', true);
+      if (!tenants || tenants.length === 0) {
+        console.log('ℹ️  No active tenants found. Create one via admin dashboard.');
+        return;
+      }
+      console.log(`🚀 Loading Cloud API configs for ${tenants.length} tenants...`);
+      for (const tenant of tenants) {
+        try {
+          await waManager.loadFromDB(tenant.id);
+        } catch (err) {
+          console.error(`❌ Failed to load config for tenant ${tenant.id} (${tenant.name}):`, err.message);
+        }
+      }
+      return; // success
+    } catch (err) {
+      console.error(`❌ Failed to load tenants (attempt ${attempt}/${retries}):`, err.message);
+      if (attempt < retries) await delay(5000 * attempt);
+    }
+  }
+  console.error('❌ Could not reach Supabase after all retries. Tenants will load on first request.');
 }
 
 // ══════════════════════════════════════════════
@@ -796,6 +835,13 @@ function adminAuth(req, res, next) {
   req.adminUsername = decoded.username;
   next();
 }
+
+// ══════════════════════════════════════════════
+// PUBLIC HEALTH CHECK (no auth — for Render / load balancers)
+// ══════════════════════════════════════════════
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', uptime: Math.floor(process.uptime()), ts: Date.now() });
+});
 
 // ══════════════════════════════════════════════
 // WEBHOOK ROUTES (must be before auth - no cookies)
@@ -1458,15 +1504,11 @@ app.post('/api/send-reply', tenantAuth, sendLimiter, async (req, res) => {
         .eq('tenant_id', req.tenantId).eq('phone', cleanedPhone)
     ]);
 
-    // Non-blocking copy-paste detection
+    // Non-blocking copy-paste detection (in-memory — no DB query)
     setImmediate(async () => {
       try {
-        const oneHourAgo = new Date(Date.now() - 3600000).toISOString();
-        const { data: sameMsg } = await supabase.from('conversations')
-          .select('phone').eq('tenant_id', req.tenantId).eq('direction', 'outgoing')
-          .eq('message', message).gte('created_at', oneHourAgo);
-        const uniquePhones = new Set((sameMsg || []).map(r => r.phone));
-        if (uniquePhones.size >= 3) {
+        const uniqueCount = trackCopyPaste(req.tenantId, cleanedPhone, message);
+        if (uniqueCount >= 3) {
           const alreadyNotified = adminNotifications.some(n =>
             n.type === 'copy_paste' && n.tenant_id === req.tenantId &&
             (Date.now() - new Date(n.timestamp).getTime()) < 900000
@@ -1475,7 +1517,7 @@ app.post('/api/send-reply', tenantAuth, sendLimiter, async (req, res) => {
             const { data: td } = await supabase.from('tenants').select('name').eq('id', req.tenantId).maybeSingle();
             const tname = td?.name || `Marketer #${req.tenantId}`;
             pushAdminNotif('copy_paste',
-              `"${tname}" sent identical message to ${uniquePhones.size} different contacts in the last hour. Message: "${message.substring(0, 50)}${message.length > 50 ? '...' : ''}"`,
+              `"${tname}" sent identical message to ${uniqueCount} different contacts in the last hour. Message: "${message.substring(0, 50)}${message.length > 50 ? '...' : ''}"`,
               req.tenantId, tname
             );
           }
@@ -2316,11 +2358,19 @@ app.listen(PORT, () => {
   console.log('');
 
   initAllTenants();
+
+  // Keep Supabase project alive (free tier pauses after ~7 days of inactivity)
+  setInterval(async () => {
+    try {
+      await supabase.from('tenants').select('id', { count: 'exact', head: true });
+    } catch (_) {}
+  }, 20 * 60 * 1000); // every 20 minutes (sufficient to prevent free-tier pause)
 });
 
 // ── Graceful Shutdown ───────────────────────
 process.on('SIGINT', async () => {
   console.log('\n🛑 Shutting down gracefully...');
+  clearInterval(globalSchedulerInterval);
   waManager.destroyAll();
   process.exit(0);
 });

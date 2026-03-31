@@ -9,7 +9,7 @@
     "env": "node",
     "plan": "free",
     "region": "oregon",
-    "healthCheckPath": "/api/health",
+    "healthCheckPath": "/health",
     "envSpecificDetails": {
       "buildCommand": "npm install",
       "startCommand": "node server.js"
