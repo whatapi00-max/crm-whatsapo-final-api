@@ -52,10 +52,10 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
 }
 
 // ── Supabase Client ─────────────────────────
-// Custom fetch with 28s timeout to prevent hanging on Supabase outages / free-tier pauses
+// Custom fetch with 10s timeout to prevent hanging on Supabase outages / free-tier pauses
 const supabaseFetch = async (url, options = {}) => {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 28000);
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
   try {
     return await fetch(url, { ...options, signal: controller.signal });
   } finally {

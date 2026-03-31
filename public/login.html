@@ -153,8 +153,9 @@
             unique_key: document.getElementById('m-key').value.trim()
           })
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Login failed');
+        let data;
+        try { data = await res.json(); } catch (_) {}
+        if (!res.ok) throw new Error(data?.error || (res.status === 429 ? 'Too many attempts, wait a moment' : res.status >= 500 ? 'Server error, please try again' : 'Login failed'));
         window.location.href = '/crm/' + data.user.id;
       } catch (err) {
         errEl.textContent = err.message;
@@ -182,8 +183,9 @@
             password: document.getElementById('a-password').value
           })
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Login failed');
+        let data;
+        try { data = await res.json(); } catch (_) {}
+        if (!res.ok) throw new Error(data?.error || (res.status === 429 ? 'Too many attempts, wait a moment' : res.status >= 500 ? 'Server error, please try again' : 'Login failed'));
         window.location.href = '/admin';
       } catch (err) {
         errEl.textContent = err.message;
