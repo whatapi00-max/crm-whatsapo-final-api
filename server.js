@@ -45,15 +45,10 @@ function isAbortError(err) {
   return err && (err.name === 'AbortError' || err.code === 'ABORT_ERR' ||
     (err.message && err.message.toLowerCase().includes('aborted')));
 }
+
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
   console.error('❌ SUPABASE_URL and SUPABASE_KEY environment variables are required!');
   process.exit(1);
-}
-
-// Helper: suppress AbortError / timeout noise from logs
-function isAbortError(err) {
-  return err && (err.name === 'AbortError' || err.code === 'ABORT_ERR' ||
-    (err.message && err.message.toLowerCase().includes('aborted')));
 }
 
 // ── Supabase Client ─────────────────────────
@@ -2318,13 +2313,10 @@ app.get('/', (req, res) => {
 });
 
 app.get('/login', (req, res) => {
-  const decoded = verifyTenantToken(req);
-  if (decoded) {
-    if (decoded.role === 'admin') return res.redirect('/admin');
-    return res.redirect(`/crm/${decoded.tenant_id}`);
-  }
   const adminDecoded = verifyToken(req, 'crm_admin_token');
   if (adminDecoded && adminDecoded.role === 'admin') return res.redirect('/admin');
+  const decoded = verifyTenantToken(req);
+  if (decoded && decoded.role === 'tenant') return res.redirect(`/crm/${decoded.tenant_id}`);
   res.sendFile(path.join(__dirname, 'public', 'login.html'));
 });
 
