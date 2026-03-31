@@ -40,17 +40,27 @@ if (!process.env.WEBHOOK_VERIFY_TOKEN) {
   console.log('⚠️  WEBHOOK_VERIFY_TOKEN not set in .env — using default "billy777_verify"');
 }
 
-// ── Env Validation ───────────────────────────
+// Helper: suppress AbortError / timeout noise from logs
+function isAbortError(err) {
+  return err && (err.name === 'AbortError' || err.code === 'ABORT_ERR' ||
+    (err.message && err.message.toLowerCase().includes('aborted')));
+}
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
   console.error('❌ SUPABASE_URL and SUPABASE_KEY environment variables are required!');
   process.exit(1);
 }
 
+// Helper: suppress AbortError / timeout noise from logs
+function isAbortError(err) {
+  return err && (err.name === 'AbortError' || err.code === 'ABORT_ERR' ||
+    (err.message && err.message.toLowerCase().includes('aborted')));
+}
+
 // ── Supabase Client ─────────────────────────
-// Custom fetch with 15s timeout to prevent hanging on Supabase outages / free-tier pauses
+// Custom fetch with 28s timeout to prevent hanging on Supabase outages / free-tier pauses
 const supabaseFetch = async (url, options = {}) => {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 15000);
+  const timeoutId = setTimeout(() => controller.abort(), 28000);
   try {
     return await fetch(url, { ...options, signal: controller.signal });
   } finally {
@@ -534,8 +544,8 @@ async function initAllTenants(retries = 5) {
       }
       return; // success
     } catch (err) {
-      console.error(`❌ Failed to load tenants (attempt ${attempt}/${retries}):`, err.message);
-      if (attempt < retries) await delay(5000 * attempt);
+    if (!isAbortError(err)) console.error(`❌ Failed to load tenants (attempt ${attempt}/${retries}):`, err.message);
+    if (attempt < retries) await delay(5000 * attempt);
     }
   }
   console.error('❌ Could not reach Supabase after all retries. Tenants will load on first request.');
@@ -1394,7 +1404,10 @@ app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
     setCachedResponse(cacheKey, result, 60000); // 60s cache
     res.json(result);
   } catch (err) {
-    if (err.name !== 'AbortError') console.error('Dashboard error:', err.message);
+    if (!isAbortError(err)) console.error('Dashboard error:', err.message);
+    // Return last cached value if available, otherwise empty shell
+    const stale = getCachedResponse ? responseCache.get('admin_dashboard') : null;
+    if (stale) return res.json(stale.data);
     res.status(500).json({ error: 'Failed to fetch dashboard' });
   }
 });
