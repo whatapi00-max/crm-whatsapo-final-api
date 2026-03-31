@@ -418,11 +418,11 @@ class CloudAPIManager {
   // ── Auto-Reply Check ──────────────────────
   async checkAutoReply(tenantId, phone, body, isNew) {
     try {
-      const { data: rules } = await supabase.from('auto_replies')
+      const { data: rules, error: rulesErr } = await supabase.from('auto_replies')
         .select('*').eq('tenant_id', tenantId).eq('is_active', true)
         .order('priority', { ascending: false });
 
-      if (!rules || rules.length === 0) return;
+      if (rulesErr || !rules || rules.length === 0) return;
       const lowerBody = body.toLowerCase();
 
       for (const rule of rules) {
@@ -496,11 +496,12 @@ const globalSchedulerInterval = setInterval(async () => {
   if (schedulerRunning) return;
   schedulerRunning = true;
   try {
-    const { data: pending } = await supabase.from('scheduled_messages')
+    const { data: pending, error: pendErr } = await supabase.from('scheduled_messages')
       .select('*').eq('status', 'pending')
       .lte('scheduled_at', new Date().toISOString())
       .order('scheduled_at', { ascending: true }).limit(20);
 
+    if (pendErr) { console.error('⚠️  Scheduler DB error:', pendErr.message); return; }
     if (!pending || pending.length === 0) return;
 
     for (const sm of pending) {
@@ -581,8 +582,12 @@ async function handleIncomingWebhook(entry) {
     let resolvedTenantId = waManager.findTenantByPhoneNumberId(phoneNumberId);
     if (!resolvedTenantId) {
       // Try loading from DB in case config was added recently
-      const { data: tenant } = await supabase.from('tenants')
+      const { data: tenant, error: tenantErr } = await supabase.from('tenants')
         .select('id').eq('wa_phone_number_id', phoneNumberId).eq('is_active', true).maybeSingle();
+      if (tenantErr) {
+        console.error(`⚠️  Webhook DB lookup failed for phone_number_id ${phoneNumberId}:`, tenantErr.message);
+        continue;
+      }
       if (tenant) {
         await waManager.loadFromDB(tenant.id);
         resolvedTenantId = tenant.id;
@@ -866,8 +871,23 @@ function adminAuth(req, res, next) {
 // ══════════════════════════════════════════════
 // PUBLIC HEALTH CHECK (no auth — for Render / load balancers)
 // ══════════════════════════════════════════════
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: Math.floor(process.uptime()), ts: Date.now() });
+app.get('/health', async (req, res) => {
+  // Quick Supabase connectivity check
+  let dbOk = true;
+  try {
+    const { error } = await supabase.from('tenants').select('id', { count: 'exact', head: true }).limit(1);
+    if (error) dbOk = false;
+  } catch (_) { dbOk = false; }
+
+  const mem = process.memoryUsage();
+  res.json({
+    status: dbOk ? 'ok' : 'degraded',
+    uptime: Math.floor(process.uptime()),
+    ts: Date.now(),
+    db: dbOk ? 'connected' : 'unreachable',
+    memory_mb: Math.round(mem.rss / 1024 / 1024),
+    active_tenants: waManager.configs.size
+  });
 });
 
 // ══════════════════════════════════════════════
@@ -1201,6 +1221,8 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
         .gte('created_at', new Date(Date.now() - 86400000).toISOString())
     ]);
 
+    if (tenantsRes.error) throw tenantsRes.error;
+
     const result = {
       total_tenants: tenantsRes.count || 0,
       total_leads: leadsRes.count || 0,
@@ -1365,6 +1387,7 @@ app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
 
     // Run all tenant queries in parallel but only 4 queries each (removed hourData — uses in-memory cpTracker)
     const marketers = await Promise.all((allTenants || []).map(async (t) => {
+      try {
       const [leadsRes, msgsToday, weekData, incomingToday] = await Promise.all([
         supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', t.id),
         supabase.from('conversations').select('id', { count: 'exact', head: true })
@@ -1405,6 +1428,15 @@ app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
         copy_paste_warning: copyPasteWarn,
         copy_paste_max: copyPasteMax,
       };
+      } catch (tErr) {
+        console.error(`⚠️  Dashboard stats failed for tenant ${t.id}:`, tErr.message);
+        return {
+          id: t.id, name: t.name, username: t.username,
+          is_active: t.is_active, wa_status: waManager.getStatus(t.id),
+          stats: { total_leads: 0, messages_today: 0, messages_week: 0, incoming_today: 0, weekly_chart: new Array(7).fill(0) },
+          copy_paste_warning: false, copy_paste_max: 0, error: true,
+        };
+      }
     }));
 
     const result = {
@@ -2087,8 +2119,13 @@ app.post('/api/broadcasts/:id/cancel', tenantAuth, async (req, res) => {
 
 async function sendBroadcastAsync(tenantId, broadcastId, message) {
   try {
-    const { data: recipients } = await supabase.from('broadcast_recipients')
+    const { data: recipients, error: recipErr } = await supabase.from('broadcast_recipients')
       .select('*').eq('broadcast_id', broadcastId).eq('status', 'pending');
+    if (recipErr) {
+      console.error('❌ Broadcast recipients fetch error:', recipErr.message);
+      await supabase.from('broadcasts').update({ status: 'cancelled' }).eq('id', broadcastId);
+      return;
+    }
 
     let sentCount = 0, failedCount = 0;
     for (let i = 0; i < (recipients || []).length; i++) {
@@ -2271,20 +2308,22 @@ app.get('/api/active-chats', tenantAuth, async (req, res) => {
 
     // Batch: get last message for all leads in ONE query using RPC or multiple-filter
     // We'll get recent conversations and group by phone in JS
-    const { data: recentMsgs } = await supabase.from('conversations')
+    const { data: recentMsgs, error: msgErr } = await supabase.from('conversations')
       .select('phone, message, direction, created_at')
       .eq('tenant_id', tid)
       .in('phone', phones)
       .order('created_at', { ascending: false })
       .limit(phones.length * 2); // 2x to ensure at least 1 per phone
+    if (msgErr) console.error('⚠️  Active chats recentMsgs error:', msgErr.message);
 
     // Batch: get unread counts for all phones in ONE query
-    const { data: unreadRows } = await supabase.from('conversations')
+    const { data: unreadRows, error: unreadErr } = await supabase.from('conversations')
       .select('phone')
       .eq('tenant_id', tid)
       .in('phone', phones)
       .eq('direction', 'incoming')
       .eq('status', 'received');
+    if (unreadErr) console.error('⚠️  Active chats unreadRows error:', unreadErr.message);
 
     // Build lookup maps
     const lastMsgMap = new Map();
@@ -2363,14 +2402,23 @@ app.get('/crm/:tid', async (req, res) => {
     return res.redirect('/login');
   }
 
-  const { data: tenant } = await supabase.from('tenants')
-    .select('id, is_active').eq('id', tid).maybeSingle();
-  if (!tenant || !tenant.is_active) {
-    res.clearCookie(`crm_token_${tid}`);
+  try {
+    const { data: tenant, error: tErr } = await supabase.from('tenants')
+      .select('id, is_active').eq('id', tid).maybeSingle();
+    if (tErr) {
+      console.error('⚠️  /crm/:tid DB error:', tErr.message);
+      return res.redirect('/login');
+    }
+    if (!tenant || !tenant.is_active) {
+      res.clearCookie(`crm_token_${tid}`);
+      return res.redirect('/login');
+    }
+
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  } catch (err) {
+    console.error('⚠️  /crm/:tid error:', err.message);
     return res.redirect('/login');
   }
-
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 app.get('*', (req, res) => {
@@ -2399,9 +2447,28 @@ app.listen(PORT, () => {
   initAllTenants();
 });
 
+// ── Process-Level Error Handlers ────────────
+process.on('uncaughtException', (err) => {
+  console.error('🔥 FATAL: Uncaught Exception:', err);
+  // Let the process manager (Render/PM2) restart us
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('🔥 Unhandled Rejection:', reason);
+  // Don't crash — log and continue for rejected promises
+});
+
 // ── Graceful Shutdown ───────────────────────
 process.on('SIGINT', async () => {
   console.log('\n🛑 Shutting down gracefully...');
+  clearInterval(globalSchedulerInterval);
+  waManager.destroyAll();
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('\n🛑 SIGTERM received, shutting down...');
   clearInterval(globalSchedulerInterval);
   waManager.destroyAll();
   process.exit(0);
