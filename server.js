@@ -159,9 +159,11 @@ class CloudAPIManager {
 
   async loadFromDB(tenantId) {
     const tid = String(tenantId);
-    const { data: tenant } = await supabase.from('tenants')
+    const { data: tenant, error } = await supabase.from('tenants')
       .select('wa_phone_number_id, wa_access_token, wa_waba_id')
       .eq('id', tenantId).maybeSingle();
+
+    if (error) throw error;
 
     if (tenant && tenant.wa_phone_number_id && tenant.wa_access_token) {
       this.configs.set(tid, {
@@ -524,7 +526,8 @@ const globalSchedulerInterval = setInterval(async () => {
 async function initAllTenants(retries = 5) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const { data: tenants } = await supabase.from('tenants').select('id, name').eq('is_active', true);
+      const { data: tenants, error: tenantsErr } = await supabase.from('tenants').select('id, name').eq('is_active', true);
+      if (tenantsErr) throw tenantsErr;
       if (!tenants || tenants.length === 0) {
         console.log('ℹ️  No active tenants found. Create one via admin dashboard.');
         return;
