@@ -4,7 +4,7 @@
 // ============================================
 
 const API_BASE = '';
-const REFRESH_INTERVAL = 15000; // 15s instead of 5s — reduces server load 3x
+const REFRESH_INTERVAL = 30000; // 30s — reduces DB requests significantly
 
 // ── Extract Tenant ID from URL (/crm/:tid) ──
 const TENANT_ID = (() => {
@@ -86,15 +86,16 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 // ── Session Timeout Monitor ────────────────
 function startSessionCheck() {
-  // Check session validity every 60 seconds
+  // Check session validity every 5 minutes (no need to poll frequently)
   setInterval(async () => {
+    if (document.hidden) return; // skip if tab is not visible
     try {
       const res = await fetch('/api/auth/check', { headers: tenantHeaders() });
       if (res.status === 401) {
         window.location.href = '/login';
       }
     } catch {}
-  }, 60000);
+  }, 300000);
 }
 
 // ── Admin Warning Freeze System ─────────────
@@ -113,14 +114,14 @@ function startWarningPoll() {
   // Check immediately on load – catches active freeze after page refresh
   checkWarnOnce();
   setInterval(async () => {
-    if (_warnActive) return; // already frozen, don't poll
+    if (_warnActive || document.hidden) return; // skip if frozen or tab hidden
     try {
       const res = await fetch('/api/warn-check', { headers: tenantHeaders() });
       if (!res.ok) return;
       const data = await res.json();
       if (data.warned) triggerAdminFreeze(data.message, data.remaining_seconds || 60);
     } catch {}
-  }, 5000); // poll every 5 seconds
+  }, 30000); // poll every 30 seconds
 }
 
 function triggerAdminFreeze(message, totalSecs) {

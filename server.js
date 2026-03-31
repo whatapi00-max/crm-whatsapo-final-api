@@ -527,7 +527,7 @@ const globalSchedulerInterval = setInterval(async () => {
   } finally {
     schedulerRunning = false;
   }
-}, 60000); // 60 s — replaces N×30s per-tenant intervals
+}, 120000); // 120s — check for pending scheduled messages every 2 min
 
 // ── Initialize All Active Tenants ───────────
 let _initRunning = false;
@@ -872,12 +872,18 @@ function adminAuth(req, res, next) {
 // PUBLIC HEALTH CHECK (no auth — for Render / load balancers)
 // ══════════════════════════════════════════════
 app.get('/health', async (req, res) => {
-  // Quick Supabase connectivity check
+  // Cache the DB check for 30s to avoid hammering Supabase
   let dbOk = true;
-  try {
-    const { error } = await supabase.from('tenants').select('id', { count: 'exact', head: true }).limit(1);
-    if (error) dbOk = false;
-  } catch (_) { dbOk = false; }
+  const cached = getCachedResponse('_health_db');
+  if (cached !== null) {
+    dbOk = cached;
+  } else {
+    try {
+      const { error } = await supabase.from('tenants').select('id', { count: 'exact', head: true }).limit(1);
+      if (error) dbOk = false;
+    } catch (_) { dbOk = false; }
+    setCachedResponse('_health_db', dbOk, 30000);
+  }
 
   const mem = process.memoryUsage();
   res.json({
@@ -1009,12 +1015,18 @@ app.get('/api/auth/check', async (req, res) => {
   if (!decoded) return res.status(401).json({ authenticated: false });
 
   if (decoded.role === 'tenant') {
-    const { data: tenant } = await supabase.from('tenants')
-      .select('id, is_active').eq('id', decoded.tenant_id).maybeSingle();
-    if (!tenant || !tenant.is_active) {
-      res.clearCookie(`crm_token_${decoded.tenant_id}`);
-      res.clearCookie('crm_token');
-      return res.status(401).json({ authenticated: false, reason: 'deleted' });
+    // Cache tenant active-check for 60s to avoid repeated DB hits
+    const cacheKey = `auth_check_${decoded.tenant_id}`;
+    const cached = getCachedResponse(cacheKey);
+    if (!cached) {
+      const { data: tenant } = await supabase.from('tenants')
+        .select('id, is_active').eq('id', decoded.tenant_id).maybeSingle();
+      if (!tenant || !tenant.is_active) {
+        res.clearCookie(`crm_token_${decoded.tenant_id}`);
+        res.clearCookie('crm_token');
+        return res.status(401).json({ authenticated: false, reason: 'deleted' });
+      }
+      setCachedResponse(cacheKey, true, 60000);
     }
   }
 
@@ -1049,7 +1061,7 @@ app.get('/api/admin/tenants', adminAuth, async (req, res) => {
       wa_configured: !!(t.wa_phone_number_id)
     }));
 
-    setCachedResponse(cacheKey, tenants, 30000);
+    setCachedResponse(cacheKey, tenants, 60000);
     res.json(tenants);
   } catch (err) {
     console.error('Failed to fetch tenants:', err.message);
@@ -1228,7 +1240,7 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
       total_leads: leadsRes.count || 0,
       messages_today: msgsRes.count || 0
     };
-    setCachedResponse(cacheKey, result, 60000);
+    setCachedResponse(cacheKey, result, 120000);
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch admin stats' });
@@ -1304,7 +1316,7 @@ app.get('/api/admin/storage', adminAuth, async (req, res) => {
       },
       uptime_seconds: Math.floor(process.uptime()),
     };
-    setCachedResponse('admin_storage', storageResult, 60000);
+    setCachedResponse('admin_storage', storageResult, 120000);
     res.json(storageResult);
   } catch (err) {
     console.error('Storage stats error:', err.message);
@@ -1445,7 +1457,7 @@ app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
       total_messages_week: marketers.reduce((s, m) => s + m.stats.messages_week, 0),
       copy_paste_alerts: marketers.filter(m => m.copy_paste_warning).length,
     };
-    setCachedResponse(cacheKey, result, 60000); // 60s cache
+    setCachedResponse(cacheKey, result, 120000); // 120s cache
     res.json(result);
   } catch (err) {
     if (!isAbortError(err)) console.error('Dashboard error:', err.message);
@@ -1818,8 +1830,8 @@ app.post('/api/leads/:phone/resolve', tenantAuth, async (req, res) => {
 
 // ── In-memory response cache for heavy read endpoints ──
 const responseCache = new Map(); // key -> { data, ts }
-const RESP_CACHE_TTL = 10000; // 10s for stats
-const RESP_CACHE_TTL_LONG = 30000; // 30s for analytics
+const RESP_CACHE_TTL = 30000; // 30s for stats (was 10s)
+const RESP_CACHE_TTL_LONG = 60000; // 60s for analytics (was 30s)
 
 function getCachedResponse(key) {
   const cached = responseCache.get(key);
@@ -2291,6 +2303,13 @@ app.get('/api/active-chats', tenantAuth, async (req, res) => {
     const tid = req.tenantId;
     const since = req.query.since || null; // ISO timestamp for incremental updates
 
+    // Cache full loads (no 'since') for 5s to prevent rapid re-fetches
+    if (!since) {
+      const cacheKey = `active_chats_${tid}`;
+      const cached = getCachedResponse(cacheKey);
+      if (cached) { res.set('Cache-Control', 'private, max-age=5'); return res.json(cached); }
+    }
+
     // If client sends 'since', return only leads updated after that time
     let leadsQuery = supabase.from('leads')
       .select('id, phone, real_phone, name, email, company, source, status, tags, notes, revenue, assigned_to, created_at, last_message_at')
@@ -2344,6 +2363,7 @@ app.get('/api/active-chats', tenantAuth, async (req, res) => {
       unread_count: unreadMap.get(lead.phone) || 0
     }));
 
+    if (!since) setCachedResponse(`active_chats_${tid}`, chats, 5000);
     res.json(chats);
   } catch (err) {
     console.error('Active chats error:', err.message);
