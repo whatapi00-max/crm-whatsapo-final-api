@@ -523,7 +523,7 @@ const globalSchedulerInterval = setInterval(async () => {
 }, 60000); // 60 s — replaces N×30s per-tenant intervals
 
 // ── Initialize All Active Tenants ───────────
-async function initAllTenants(retries = 5) {
+async function initAllTenants(retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const { data: tenants, error: tenantsErr } = await supabase.from('tenants').select('id, name').eq('is_active', true);
@@ -542,11 +542,11 @@ async function initAllTenants(retries = 5) {
       }
       return; // success
     } catch (err) {
-    if (!isAbortError(err)) console.error(`❌ Failed to load tenants (attempt ${attempt}/${retries}):`, err.message);
-    if (attempt < retries) await delay(5000 * attempt);
+      if (!isAbortError(err)) console.error(`❌ Failed to load tenants (attempt ${attempt}/${retries}):`, err.message);
+      if (attempt < retries) await delay(2000);
     }
   }
-  console.error('❌ Could not reach Supabase after all retries. Tenants will load on first request.');
+  console.warn('⚠️  Could not pre-load tenants on startup. Configs will lazy-load on first request.');
 }
 
 // ══════════════════════════════════════════════
@@ -818,6 +818,11 @@ async function tenantAuth(req, res, next) {
   req.tenantId = decoded.tenant_id;
   req.tenantName = decoded.name;
   req.tenantUsername = decoded.username;
+
+  // Lazy-load WA config if not in memory (e.g. after startup timeout)
+  if (!waManager.getConfig(decoded.tenant_id)) {
+    try { await waManager.loadFromDB(decoded.tenant_id); } catch (_) {}
+  }
 
   const cookieName = `crm_token_${decoded.tenant_id}`;
   const now = Math.floor(Date.now() / 1000);
