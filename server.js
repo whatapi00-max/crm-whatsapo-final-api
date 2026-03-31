@@ -803,13 +803,30 @@ function verifyTenantToken(req) {
 
 // ── Tenant verification cache (avoids DB hit on every API call) ──
 const tenantVerifyCache = new Map(); // tenantId -> { active, ts }
-const TENANT_CACHE_TTL = 120000; // 120s (2 min) — reduces DB hits for 100+ marketers
+const TENANT_CACHE_TTL = 120000; // 120s (2 min)
 
 function isTenantCachedActive(tenantId) {
   const cached = tenantVerifyCache.get(tenantId);
   if (cached && (Date.now() - cached.ts) < TENANT_CACHE_TTL) return cached.active;
   return null;
 }
+
+// Invalidate all caches for a tenant (call on update/delete/deactivate)
+function invalidateTenantCache(tenantId) {
+  tenantVerifyCache.delete(tenantId);
+  responseCache.delete(`auth_check_${tenantId}`);
+  responseCache.delete(`active_chats_${tenantId}`);
+  responseCache.delete(`stats_${tenantId}`);
+  responseCache.delete('admin_tenants');
+}
+
+// Evict expired tenantVerifyCache entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of tenantVerifyCache) {
+    if (now - entry.ts >= TENANT_CACHE_TTL) tenantVerifyCache.delete(id);
+  }
+}, 300000);
 
 async function tenantAuth(req, res, next) {
   const decoded = verifyTenantToken(req);
@@ -846,9 +863,9 @@ async function tenantAuth(req, res, next) {
   }
 
   const cookieName = `crm_token_${decoded.tenant_id}`;
-  const now = Math.floor(Date.now() / 1000);
-  const tokenAge = now - (decoded.iat || 0);
-  if (tokenAge > 300) {
+  // Refresh only when token has < 5 min remaining (not on every request after 5 min)
+  const timeToExpiry = (decoded.exp || 0) - Math.floor(Date.now() / 1000);
+  if (timeToExpiry > 0 && timeToExpiry < 300) {
     const newToken = jwt.sign({
       tenant_id: decoded.tenant_id, username: decoded.username,
       name: decoded.name, role: 'tenant'
@@ -1096,6 +1113,7 @@ app.post('/api/admin/tenants', adminAuth, async (req, res) => {
     if (error) throw error;
 
     console.log(`✅ Tenant created: ${data.username} (ID: ${data.id})`);
+    responseCache.delete('admin_tenants'); // Bust cache so admin sees new tenant immediately
     res.json({ ...data, password_plain: String(password), wa_status: 'not_configured' });
   } catch (err) {
     console.error('Create tenant error:', err.message);
@@ -1121,6 +1139,7 @@ app.put('/api/admin/tenants/:id', adminAuth, async (req, res) => {
       .select('id, username, unique_key, name, is_active, created_at, updated_at').single();
     if (error) throw error;
 
+    invalidateTenantCache(id); // Force re-check on next request (handles deactivation)
     res.json({ ...data, wa_status: waManager.getStatus(id) });
   } catch (err) {
     res.status(500).json({ error: 'Failed to update tenant' });
@@ -1132,6 +1151,7 @@ app.delete('/api/admin/tenants/:id', adminAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
     waManager.removeConfig(id);
+    invalidateTenantCache(id); // Immediately revoke all auth caches
 
     const { error } = await supabase.from('tenants').delete().eq('id', id);
     if (error) throw error;
@@ -1856,33 +1876,33 @@ app.get('/api/stats', tenantAuth, async (req, res) => {
     const tid = req.tenantId;
     const cacheKey = `stats_${tid}`;
     const cached = getCachedResponse(cacheKey);
-    if (cached) { res.set('Cache-Control', 'private, max-age=10'); return res.json(cached); }
-    const [leadsRes, soldRes, newRes, intRes, contRes, revenueRes, msgsRes, inRes, outRes] = await Promise.all([
-      supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid),
-      supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('status', 'sold'),
-      supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('status', 'new'),
-      supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('status', 'interested'),
-      supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('status', 'contacted'),
-      supabase.from('leads').select('revenue').eq('tenant_id', tid),
-      supabase.from('conversations').select('id', { count: 'exact', head: true })
-        .eq('tenant_id', tid).gte('created_at', new Date(Date.now() - 86400000).toISOString()),
-      supabase.from('conversations').select('id', { count: 'exact', head: true })
-        .eq('tenant_id', tid).eq('direction', 'incoming').gte('created_at', new Date(Date.now() - 86400000).toISOString()),
-      supabase.from('conversations').select('id', { count: 'exact', head: true })
-        .eq('tenant_id', tid).eq('direction', 'outgoing').gte('created_at', new Date(Date.now() - 86400000).toISOString())
-    ]);
+    if (cached) { res.set('Cache-Control', 'private, max-age=30'); return res.json(cached); }
 
-    const totalRevenue = (revenueRes.data || []).reduce((sum, l) => sum + (parseFloat(l.revenue) || 0), 0);
+    // 2 queries instead of 9 — same data, 78% fewer Supabase API calls
+    const since24h = new Date(Date.now() - 86400000).toISOString();
+    const [leadsData, msgsData] = await Promise.all([
+      supabase.from('leads').select('status, revenue').eq('tenant_id', tid),
+      supabase.from('conversations').select('direction').eq('tenant_id', tid).gte('created_at', since24h)
+    ]);
+    if (leadsData.error) throw leadsData.error;
+
+    const leads = leadsData.data || [];
+    const msgs = msgsData.data || [];
 
     const result = {
-      total_leads: leadsRes.count || 0, new_leads: newRes.count || 0,
-      sold_leads: soldRes.count || 0, interested_leads: intRes.count || 0,
-      contacted_leads: contRes.count || 0, total_revenue: totalRevenue,
-      messages_today: msgsRes.count || 0, incoming_today: inRes.count || 0,
-      outgoing_today: outRes.count || 0
+      total_leads: leads.length,
+      new_leads: leads.filter(l => l.status === 'new').length,
+      sold_leads: leads.filter(l => l.status === 'sold').length,
+      interested_leads: leads.filter(l => l.status === 'interested').length,
+      contacted_leads: leads.filter(l => l.status === 'contacted').length,
+      lost_leads: leads.filter(l => l.status === 'lost').length,
+      total_revenue: leads.reduce((sum, l) => sum + (parseFloat(l.revenue) || 0), 0),
+      messages_today: msgs.length,
+      incoming_today: msgs.filter(m => m.direction === 'incoming').length,
+      outgoing_today: msgs.filter(m => m.direction === 'outgoing').length
     };
     setCachedResponse(cacheKey, result);
-    res.set('Cache-Control', 'private, max-age=10');
+    res.set('Cache-Control', 'private, max-age=30');
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch stats' });
@@ -2423,17 +2443,22 @@ app.get('/crm/:tid', async (req, res) => {
   }
 
   try {
-    const { data: tenant, error: tErr } = await supabase.from('tenants')
-      .select('id, is_active').eq('id', tid).maybeSingle();
-    if (tErr) {
-      console.error('⚠️  /crm/:tid DB error:', tErr.message);
-      return res.redirect('/login');
+    // Use tenantVerifyCache to avoid a DB hit on every page load
+    let isActive = isTenantCachedActive(tid);
+    if (isActive === null) {
+      const { data: tenant, error: tErr } = await supabase.from('tenants')
+        .select('id, is_active').eq('id', tid).maybeSingle();
+      if (tErr) {
+        console.error('⚠️  /crm/:tid DB error:', tErr.message);
+        return res.redirect('/login');
+      }
+      isActive = !!(tenant && tenant.is_active);
+      tenantVerifyCache.set(tid, { active: isActive, ts: Date.now() });
     }
-    if (!tenant || !tenant.is_active) {
+    if (!isActive) {
       res.clearCookie(`crm_token_${tid}`);
       return res.redirect('/login');
     }
-
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
   } catch (err) {
     console.error('⚠️  /crm/:tid error:', err.message);
