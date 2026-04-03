@@ -4,7 +4,12 @@
 // ============================================
 
 const API_BASE = '';
-const REFRESH_INTERVAL = 30000; // 30s — reduces DB requests significantly
+const REFRESH_INTERVAL = 45000; // 45s — fallback polling when SSE is not connected
+
+// ── Realtime SSE state ─────────────────────
+let sseSource = null;
+let sseConnected = false;
+let sseRetryTimer = null;
 
 // ── Extract Tenant ID from URL (/crm/:tid) ──
 const TENANT_ID = (() => {
@@ -79,7 +84,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   checkConnection();
   loadActiveChats(true); // Full load on page init
   loadQuickReplies();
-  startAutoRefresh();
+  startRealtime();   // Supabase Realtime via SSE (replaces polling when connected)
+  startAutoRefresh(); // Fallback polling — slows to 2min when SSE is active
   startSessionCheck();
   startWarningPoll();
 });
@@ -423,6 +429,26 @@ function initEventListeners() {
   if (voiceCancelBtn) voiceCancelBtn.addEventListener('click', cancelVoiceRecording);
   const voiceSendBtn = $('#voice-send-btn');
   if (voiceSendBtn) voiceSendBtn.addEventListener('click', sendVoiceRecording);
+
+  // ── Image Sending ──
+  const imageBtn = $('#image-btn');
+  const imageFileInput = $('#image-file-input');
+  if (imageBtn && imageFileInput) {
+    imageBtn.addEventListener('click', () => {
+      if (!currentPhone) { showToast('Select a chat first', 'error'); return; }
+      imageFileInput.value = '';
+      imageFileInput.click();
+    });
+    imageFileInput.addEventListener('change', handleImageSelected);
+  }
+  const imageCancelBtn = $('#image-cancel-btn');
+  if (imageCancelBtn) imageCancelBtn.addEventListener('click', cancelImageSend);
+  const imageSendBtn = $('#image-send-btn');
+  if (imageSendBtn) imageSendBtn.addEventListener('click', sendImage);
+  const imageCaptionInput = $('#image-caption-input');
+  if (imageCaptionInput) imageCaptionInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendImage(); }
+  });
 }
 
 // ══════════════════════════════════════════════
@@ -638,13 +664,23 @@ function createLeadItem(chat) {
   return div;
 }
 
+function formatPreviewText(msg) {
+  if (!msg) return 'No messages yet';
+  const prefix = msg.direction === 'outgoing' ? '↗ ' : '';
+  const txt = msg.message || '';
+  if (txt === '[Image]' || txt.startsWith('📷')) return prefix + '📷 Photo';
+  if (txt === '[Video]' || txt.startsWith('🎥')) return prefix + '[Video]';
+  if (txt === '[Audio]' || txt.startsWith('🎤')) return prefix + '🎤 Voice message';
+  if (txt === '[Document]' || txt.startsWith('📄')) return prefix + '📄 Document';
+  if (txt === '[Sticker]') return prefix + '🏷️ Sticker';
+  return prefix + truncate(txt, 40);
+}
+
 function fillLeadItem(div, chat) {
   const initials = getInitials(chat.name || chat.phone);
   const avatarColor = getAvatarColor(chat.phone);
   const lastMsg = chat.last_message;
-  const lastMsgText = lastMsg
-    ? (lastMsg.direction === 'outgoing' ? '↗ ' : '') + truncate(lastMsg.message, 40)
-    : 'No messages yet';
+  const lastMsgText = formatPreviewText(lastMsg);
   const timeStr = lastMsg ? formatTime(lastMsg.created_at) : '';
   const displayPhone = chat.real_phone ? '+' + chat.real_phone : '+' + chat.phone;
 
@@ -668,9 +704,7 @@ function fillLeadItem(div, chat) {
 function updateLeadItem(div, chat) {
   div.classList.toggle('active', chat.phone === currentPhone);
   const lastMsg = chat.last_message;
-  const lastMsgText = lastMsg
-    ? (lastMsg.direction === 'outgoing' ? '↗ ' : '') + truncate(lastMsg.message, 40)
-    : 'No messages yet';
+  const lastMsgText = formatPreviewText(lastMsg);
   const timeStr = lastMsg ? formatTime(lastMsg.created_at) : '';
   const displayPhone = chat.real_phone ? '+' + chat.real_phone : '+' + chat.phone;
 
@@ -810,13 +844,38 @@ function renderMessages(messages) {
 
     // Check if this is a voice message
     const isVoice = msg.message && (msg.message.includes('🎤') || msg.message === '[Audio]');
+    // Check if this is an image message (with or without media)
+    const isImageMsg = msg.message && (msg.message.includes('📷') || msg.message === '[Image]');
+    const hasImageMedia = isImageMsg && msg.media_url;
     let contentHtml;
-    if (isVoice && msg.media_url) {
-      // Playable voice with audio proxy
+    if (hasImageMedia) {
+      const mediaSrc = API_BASE + '/api/media-proxy/' + msg.id;
+      const captionText = msg.message.replace(/^📷\s*/, '').replace(/^\[Image\]$/, '').trim();
+      contentHtml = `<div class="img-msg-bubble">
+        <div class="img-load-wrap">
+          <img class="msg-image-thumb" data-src="${escapeAttr(mediaSrc)}" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="Image" onclick="openImageFullscreen(this)" style="cursor:zoom-in">
+          <div class="img-loading-spinner"><svg class="animate-spin" width="24" height="24" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" opacity=".25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg></div>
+        </div>
+        ${captionText && captionText !== 'Image' ? `<div class="text-xs mt-1 opacity-80 whitespace-pre-wrap">${escapeHtml(captionText)}</div>` : ''}
+      </div>`;
+    } else if (isImageMsg) {
+      const captionText = msg.message.replace(/^📷\s*/, '').replace(/^\[Image\]$/, '').trim();
+      contentHtml = `<div class="media-placeholder-bubble">
+        <div class="media-placeholder">
+          <svg width="28" height="28" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+          <span>Photo</span>
+        </div>
+        ${captionText && captionText !== 'Image' ? `<div class="text-xs mt-1 opacity-80 whitespace-pre-wrap">${escapeHtml(captionText)}</div>` : ''}
+      </div>`;
+    } else if (isVoice) {
+      // Always render a play button for voice messages.
+      // If media_url is null (old message or capture issue) the audio proxy
+      // will return 404 and the existing error-toast handler will inform the user.
       const audioSrc = API_BASE + '/api/audio-proxy/' + msg.id;
-      contentHtml = `<div class="voice-msg-player" data-audio-src="${escapeAttr(audioSrc)}">
+      const hasAudio = !!msg.media_url;
+      contentHtml = `<div class="voice-msg-player${hasAudio ? '' : ' voice-no-audio'}" data-audio-src="${escapeAttr(audioSrc)}">
         <div class="flex items-center gap-3 min-w-[200px]">
-          <button class="voice-play-btn w-9 h-9 flex items-center justify-center rounded-full bg-white/15 hover:bg-white/25 transition-colors flex-shrink-0" onclick="toggleVoicePlay(this)">
+          <button class="voice-play-btn w-9 h-9 flex items-center justify-center rounded-full bg-white/15 hover:bg-white/25 transition-colors flex-shrink-0${hasAudio ? '' : ' opacity-50'}" onclick="toggleVoicePlay(this)" title="${hasAudio ? 'Play voice message' : 'Voice message (audio may not be available)'}">
             <svg class="w-5 h-5 play-icon" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
           </button>
           <div class="flex-1 min-w-0">
@@ -827,19 +886,6 @@ function renderMessages(messages) {
           <span class="text-[10px] opacity-60 voice-duration flex-shrink-0">0:00</span>
         </div>
         <audio preload="none" data-src="${escapeAttr(audioSrc)}"></audio>
-      </div>`;
-    } else if (isVoice) {
-      // Voice message without audio data (old messages)
-      contentHtml = `<div class="voice-msg-player voice-no-audio">
-        <div class="flex items-center gap-3 min-w-[200px]">
-          <div class="w-9 h-9 flex items-center justify-center rounded-full bg-white/10 flex-shrink-0">
-            <svg class="w-5 h-5 opacity-50" fill="currentColor" viewBox="0 0 24 24"><path d="M12 15c1.66 0 3-1.34 3-3V6c0-1.66-1.34-3-3-3S9 4.34 9 6v6c0 1.66 1.34 3 3 3z"/><path d="M17 12c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V22h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
-          </div>
-          <div class="flex-1">
-            <div class="h-1.5 rounded-full bg-white/10 overflow-hidden"><div class="h-full rounded-full bg-white/20" style="width:100%"></div></div>
-          </div>
-          <span class="text-[10px] opacity-40 flex-shrink-0">Voice</span>
-        </div>
       </div>`;
     } else {
       contentHtml = `<div class="whitespace-pre-wrap">${escapeHtml(msg.message)}</div>`;
@@ -856,6 +902,9 @@ function renderMessages(messages) {
   }).join('');
 
   container.scrollTop = container.scrollHeight;
+
+  // Lazy-load any image thumbnails in the chat
+  lazyLoadChatImages();
 }
 
 // ══════════════════════════════════════════════
@@ -946,7 +995,8 @@ async function toggleVoicePlay(btn) {
       const res = await fetch(audioUrl, { headers: tenantHeaders() });
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error || `HTTP ${res.status}`);
+        const errMsg = errData.error || `HTTP ${res.status}`;
+        throw new Error(res.status === 404 ? 'Audio not available for this message' : errMsg);
       }
       const blob = await res.blob();
       const blobUrl = URL.createObjectURL(blob);
@@ -1046,6 +1096,240 @@ function seekVoice(event, progressWrap) {
   const rect = progressWrap.getBoundingClientRect();
   const pct = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
   audio.currentTime = pct * audio.duration;
+}
+
+// ══════════════════════════════════════════════
+// IMAGE DISPLAY (lazy load + fullscreen)
+// ══════════════════════════════════════════════
+function lazyLoadChatImages() {
+  const images = document.querySelectorAll('.msg-image-thumb[data-src]');
+  images.forEach(img => {
+    // Skip if already loaded or already being observed
+    if (img.dataset.loaded || img.dataset.observing) return;
+    const src = img.dataset.src;
+    if (!src) return;
+    img.dataset.observing = '1';
+    // Use IntersectionObserver for lazy loading
+    if ('IntersectionObserver' in window) {
+      const obs = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+          if (entry.isIntersecting) {
+            loadChatImage(img, src);
+            obs.unobserve(img);
+          }
+        });
+      }, { rootMargin: '200px' });
+      obs.observe(img);
+      // Fallback: if observer hasn't triggered within 1.5s, load eagerly
+      setTimeout(() => {
+        if (!img.dataset.loaded) {
+          obs.unobserve(img);
+          loadChatImage(img, src);
+        }
+      }, 1500);
+    } else {
+      loadChatImage(img, src);
+    }
+  });
+}
+
+async function loadChatImage(img, src, retryCount) {
+  if (img.dataset.loaded === '1') return; // Already loaded
+  retryCount = retryCount || 0;
+  try {
+    img.style.minHeight = '80px';
+    img.style.background = 'rgba(128,128,128,0.15)';
+    const res = await fetch(src, { headers: tenantHeaders() });
+    if (!res.ok) throw new Error('Failed to load');
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    img.onload = () => {
+      img.style.minHeight = '';
+      img.style.background = '';
+      img.dataset.loaded = '1';
+      // Hide spinner
+      const spinner = img.parentElement?.querySelector('.img-loading-spinner');
+      if (spinner) spinner.style.display = 'none';
+    };
+    img.src = url;
+  } catch (err) {
+    // Retry up to 2 times with brief delay
+    if (retryCount < 2) {
+      setTimeout(() => loadChatImage(img, src, retryCount + 1), 2000);
+      return;
+    }
+    img.style.minHeight = '60px';
+    img.style.background = 'rgba(128,128,128,0.1)';
+    img.alt = 'Image unavailable';
+    img.title = 'Could not load image — click to retry';
+    img.dataset.loaded = 'err';
+    // Hide spinner, show error
+    const spinner = img.parentElement?.querySelector('.img-loading-spinner');
+    if (spinner) spinner.innerHTML = '<svg width="24" height="24" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M12 3a9 9 0 100 18 9 9 0 000-18z"/></svg>';
+    // Click to retry
+    img.style.cursor = 'pointer';
+    const retryHandler = () => {
+      img.removeEventListener('click', retryHandler);
+      img.dataset.loaded = '';
+      img.style.cursor = 'zoom-in';
+      if (spinner) { spinner.innerHTML = '<svg class="animate-spin" width="24" height="24" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" opacity=".25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg>'; spinner.style.display = ''; }
+      loadChatImage(img, img.dataset.src, 0);
+    };
+    img.addEventListener('click', retryHandler);
+  }
+}
+
+function openImageFullscreen(img) {
+  const imgSrc = img.src || '';
+  // Block if image is still a placeholder or errored
+  if (!imgSrc || imgSrc.startsWith('data:image/gif') || !img.dataset.loaded) {
+    if (img.dataset.loaded === 'err') {
+      showToast('Image could not be loaded — click thumbnail to retry', 'error');
+    } else {
+      showToast('Image is still loading…', 'info');
+    }
+    return;
+  }
+  if (img.dataset.loaded === 'err') {
+    showToast('Image could not be loaded', 'error');
+    return;
+  }
+
+  // Zoom / pan state
+  let scale = 1, tx = 0, ty = 0;
+  let dragging = false, startX = 0, startY = 0;
+  let lastPinchDist = 0;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'image-fullscreen-overlay';
+  overlay.innerHTML = `
+    <div class="image-fullscreen-wrap">
+      <img src="${escapeAttr(imgSrc)}" class="image-fullscreen-img" alt="Image" draggable="false">
+      <button class="image-fullscreen-close" title="Close (Esc)">&times;</button>
+      <div class="image-zoom-controls">
+        <button class="image-zoom-btn" data-action="zoomout" title="Zoom out">−</button>
+        <span class="image-zoom-level">100%</span>
+        <button class="image-zoom-btn" data-action="zoomin" title="Zoom in">+</button>
+      </div>
+    </div>`;
+
+  const fImg = overlay.querySelector('.image-fullscreen-img');
+  const wrap = overlay.querySelector('.image-fullscreen-wrap');
+  const zoomLabel = overlay.querySelector('.image-zoom-level');
+
+  function setTransform() {
+    fImg.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+    if (zoomLabel) zoomLabel.textContent = Math.round(scale * 100) + '%';
+    overlay.style.cursor = scale > 1 ? (dragging ? 'grabbing' : 'grab') : 'default';
+    fImg.style.cursor = scale > 1 ? (dragging ? 'grabbing' : 'grab') : 'zoom-in';
+  }
+
+  function zoom(newScale, cx, cy) {
+    const prev = scale;
+    scale = Math.max(0.5, Math.min(8, newScale));
+    if (cx !== undefined && cy !== undefined) {
+      const r = fImg.getBoundingClientRect();
+      const mx = r.left + r.width / 2, my = r.top + r.height / 2;
+      tx += (cx - mx) * (1 - scale / prev);
+      ty += (cy - my) * (1 - scale / prev);
+    }
+    if (scale <= 1) { scale = 1; tx = 0; ty = 0; }
+    setTransform();
+  }
+
+  function close() {
+    overlay.remove();
+    document.removeEventListener('keydown', onKey);
+    document.removeEventListener('mousemove', onMouseMove);
+    document.removeEventListener('mouseup', onMouseUp);
+  }
+
+  // Keyboard
+  const onKey = (e) => {
+    if (e.key === 'Escape') close();
+    else if (e.key === '+' || e.key === '=') zoom(scale * 1.25);
+    else if (e.key === '-') zoom(scale * 0.8);
+    else if (e.key === '0') { scale = 1; tx = 0; ty = 0; setTransform(); }
+  };
+  document.addEventListener('keydown', onKey);
+
+  // Mouse drag
+  const onMouseMove = (e) => {
+    if (!dragging) return;
+    tx = e.clientX - startX;
+    ty = e.clientY - startY;
+    setTransform();
+  };
+  const onMouseUp = () => { dragging = false; setTransform(); };
+  document.addEventListener('mousemove', onMouseMove);
+  document.addEventListener('mouseup', onMouseUp);
+
+  // Close
+  overlay.querySelector('.image-fullscreen-close').addEventListener('click', (e) => { e.stopPropagation(); close(); });
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay || e.target === wrap) close();
+  });
+
+  // Mouse wheel zoom
+  overlay.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    zoom(scale * (e.deltaY < 0 ? 1.15 : 0.87), e.clientX, e.clientY);
+  }, { passive: false });
+
+  // Double-click toggle zoom
+  fImg.addEventListener('dblclick', (e) => {
+    e.stopPropagation();
+    if (scale > 1.05) { scale = 1; tx = 0; ty = 0; setTransform(); }
+    else zoom(2.5, e.clientX, e.clientY);
+  });
+
+  // Mouse drag pan
+  fImg.addEventListener('mousedown', (e) => {
+    if (scale <= 1) return;
+    dragging = true;
+    startX = e.clientX - tx;
+    startY = e.clientY - ty;
+    e.preventDefault();
+  });
+
+  // Touch: pinch zoom + drag pan
+  fImg.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 2) {
+      lastPinchDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+    } else if (e.touches.length === 1 && scale > 1) {
+      dragging = true;
+      startX = e.touches[0].clientX - tx;
+      startY = e.touches[0].clientY - ty;
+    }
+  }, { passive: true });
+  fImg.addEventListener('touchmove', (e) => {
+    if (e.touches.length === 2) {
+      e.preventDefault();
+      const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+      const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      zoom(scale * (d / lastPinchDist), cx, cy);
+      lastPinchDist = d;
+    } else if (dragging && e.touches.length === 1) {
+      e.preventDefault();
+      tx = e.touches[0].clientX - startX;
+      ty = e.touches[0].clientY - startY;
+      setTransform();
+    }
+  }, { passive: false });
+  fImg.addEventListener('touchend', () => { dragging = false; lastPinchDist = 0; });
+
+  // Zoom control buttons
+  overlay.querySelectorAll('.image-zoom-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (btn.dataset.action === 'zoomin') zoom(scale * 1.4);
+      else if (btn.dataset.action === 'zoomout') zoom(scale * 0.7);
+    });
+  });
+
+  document.body.appendChild(overlay);
+  setTransform();
 }
 
 // ══════════════════════════════════════════════
@@ -1211,6 +1495,118 @@ async function sendVoiceRecording() {
   } finally {
     isSending = false;
     if (sendBtn) sendBtn.disabled = false;
+  }
+}
+
+// ══════════════════════════════════════════════
+// IMAGE SENDING
+// ══════════════════════════════════════════════
+let pendingImageFile = null;
+
+function handleImageSelected() {
+  const fileInput = $('#image-file-input');
+  const file = fileInput.files?.[0];
+  if (!file) return;
+
+  const allowedTypes = ['image/jpeg', 'image/png', 'image/webp'];
+  if (!allowedTypes.includes(file.type)) {
+    showToast('Only JPEG, PNG, and WebP images are supported', 'error');
+    fileInput.value = '';
+    return;
+  }
+  if (file.size > 5 * 1024 * 1024) {
+    showToast('Image too large. Max 5MB.', 'error');
+    fileInput.value = '';
+    return;
+  }
+
+  pendingImageFile = file;
+
+  // Show preview
+  const previewBar = $('#image-preview-bar');
+  const thumb = $('#image-preview-thumb');
+  const nameEl = $('#image-preview-name');
+  const sizeEl = $('#image-preview-size');
+  const captionInput = $('#image-caption-input');
+
+  const reader = new FileReader();
+  reader.onload = (e) => { thumb.src = e.target.result; };
+  reader.readAsDataURL(file);
+
+  nameEl.textContent = file.name;
+  const sizeKB = Math.round(file.size / 1024);
+  sizeEl.textContent = sizeKB > 1024 ? (sizeKB / 1024).toFixed(1) + ' MB' : sizeKB + ' KB';
+  captionInput.value = '';
+  previewBar.classList.remove('hidden');
+}
+
+function cancelImageSend() {
+  pendingImageFile = null;
+  const previewBar = $('#image-preview-bar');
+  if (previewBar) previewBar.classList.add('hidden');
+  const fileInput = $('#image-file-input');
+  if (fileInput) fileInput.value = '';
+  const thumb = $('#image-preview-thumb');
+  if (thumb) thumb.src = '';
+}
+
+async function sendImage() {
+  if (!pendingImageFile || !currentPhone || isSending) return;
+
+  isSending = true;
+  const sendBtn = $('#image-send-btn');
+  if (sendBtn) { sendBtn.disabled = true; sendBtn.innerHTML = '<span class="inline-block w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin"></span>'; }
+
+  const caption = ($('#image-caption-input')?.value || '').trim();
+  const msgText = caption ? `📷 ${caption}` : '📷 Image';
+
+  // Optimistic UI
+  const container = $('#chat-messages');
+  const noMsgEl = container.querySelector('.text-center');
+  if (noMsgEl) container.innerHTML = '';
+  const now = new Date();
+  const tempBubble = document.createElement('div');
+  tempBubble.className = 'flex justify-end';
+
+  // Show thumbnail in bubble
+  const thumbUrl = URL.createObjectURL(pendingImageFile);
+  tempBubble.innerHTML = `<div class="msg-bubble msg-outgoing"><div class="img-msg-bubble"><img src="${thumbUrl}" class="msg-image-thumb" alt="Image"><div class="text-xs mt-1 opacity-80">${caption ? escapeHtml(caption) : ''}</div></div><div class="msg-time text-right">${now.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} ⏳</div></div>`;
+  container.appendChild(tempBubble);
+  container.scrollTop = container.scrollHeight;
+
+  try {
+    const formData = new FormData();
+    formData.append('phone', currentPhone);
+    formData.append('image', pendingImageFile);
+    if (caption) formData.append('caption', caption);
+
+    const res = await fetch(API_BASE + '/api/send-image', {
+      method: 'POST',
+      headers: tenantHeaders(),
+      body: formData
+    });
+
+    if (handleAuthError(res.status)) throw new Error('401');
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `API error: ${res.status}`);
+    }
+
+    const timeEl = tempBubble.querySelector('.msg-time');
+    if (timeEl) timeEl.textContent = timeEl.textContent.replace('⏳', '✓✓');
+    showToast('Image sent!', 'success');
+    await loadChat(currentPhone, true);
+    loadActiveChats(true);
+  } catch (err) {
+    tempBubble.querySelector('.msg-bubble').style.borderColor = 'rgba(239,68,68,0.4)';
+    const timeEl = tempBubble.querySelector('.msg-time');
+    if (timeEl) timeEl.textContent = timeEl.textContent.replace('⏳', '❌');
+    showToast(err.message || 'Failed to send image', 'error');
+  } finally {
+    isSending = false;
+    if (sendBtn) { sendBtn.disabled = false; sendBtn.innerHTML = '<svg class="w-4 h-4 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg> Send'; }
+    URL.revokeObjectURL(thumbUrl);
+    cancelImageSend();
   }
 }
 
@@ -1860,13 +2256,68 @@ function loadSettings() {
 }
 
 // ══════════════════════════════════════════════
-// AUTO-REFRESH
+// REALTIME — SSE push from server
+// ══════════════════════════════════════════════
+function startRealtime() {
+  if (sseSource) { sseSource.close(); sseSource = null; }
+  if (sseRetryTimer) { clearTimeout(sseRetryTimer); sseRetryTimer = null; }
+
+  const url = API_BASE + '/api/events';
+  // EventSource doesn't support custom headers, so we rely on the cookie
+  // which is sent automatically by the browser (same-origin).
+  const es = new EventSource(url);
+  sseSource = es;
+
+  es.addEventListener('connected', () => {
+    sseConnected = true;
+    console.log('⚡ Realtime SSE connected');
+  });
+
+  // New message arrived in a conversation
+  es.addEventListener('new_message', (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      const phone = data.phone;
+
+      // If this chat is currently open, reload it immediately
+      if (currentPhone === phone && currentPage === 'inbox') {
+        // Invalidate cache so loadChat fetches fresh data
+        messageCache.delete(phone);
+        loadChat(phone, true);
+      } else {
+        // Invalidate cache so next open fetches fresh
+        messageCache.delete(phone);
+      }
+    } catch (_) {}
+  });
+
+  // Chat list needs updating (new message from any contact)
+  es.addEventListener('chat_updated', () => {
+    // Force-reload the sidebar chat list
+    lastChatHash = '';
+    loadActiveChats(true);
+  });
+
+  es.onerror = () => {
+    sseConnected = false;
+    es.close();
+    sseSource = null;
+    console.warn('⚡ Realtime SSE disconnected — retrying in 10s');
+    sseRetryTimer = setTimeout(startRealtime, 10000);
+  };
+}
+
+// ══════════════════════════════════════════════
+// AUTO-REFRESH (fallback polling — runs slower when SSE is active)
 // ══════════════════════════════════════════════
 function startAutoRefresh() {
   refreshTimer = setInterval(async () => {
     // Only refresh if tab is visible (don't waste resources on hidden tabs)
     if (document.hidden) return;
-    
+
+    // When SSE is connected, polling is just a safety net — run every 2 min
+    if (sseConnected) return;
+
     // Run connection check and chat list refresh in parallel
     const promises = [checkConnection(), loadActiveChats()];
     // Only refresh current chat if on inbox page AND cache is stale

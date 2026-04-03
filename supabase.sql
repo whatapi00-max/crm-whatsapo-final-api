@@ -169,3 +169,17 @@ CREATE INDEX IF NOT EXISTS idx_auto_replies_tenant ON auto_replies(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_auto_replies_active ON auto_replies(is_active);
 CREATE INDEX IF NOT EXISTS idx_activity_log_tenant ON activity_log(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_quick_replies_tenant ON quick_replies(tenant_id);
+
+-- ── 11. exec_sql helper (used by server for auto-migrations) ──
+CREATE OR REPLACE FUNCTION exec_sql(sql TEXT)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+  EXECUTE sql;
+END;
+$$;
+
+-- ── 12. Enable Realtime on conversations ──────────────────
+ALTER PUBLICATION supabase_realtime ADD TABLE public.conversations;

@@ -13,3 +13,17 @@ ALTER TABLE conversations ADD COLUMN IF NOT EXISTS media_url TEXT;
 
 -- Add index for webhook routing (find tenant by phone_number_id)
 CREATE INDEX IF NOT EXISTS idx_tenants_wa_phone_number_id ON tenants(wa_phone_number_id);
+
+-- Create exec_sql helper function (needed for server auto-migrations)
+CREATE OR REPLACE FUNCTION exec_sql(sql TEXT)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+  EXECUTE sql;
+END;
+$$;
+
+-- Enable Supabase Realtime on conversations table
+ALTER PUBLICATION supabase_realtime ADD TABLE public.conversations;

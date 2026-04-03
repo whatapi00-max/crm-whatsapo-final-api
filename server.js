@@ -103,6 +103,72 @@ function isDuplicate(tenantId, msgId) {
   return false;
 }
 
+// ── Media Binary Cache (keep downloaded media in memory for proxy) ───
+// Maps conversationId -> { buffer, contentType, ts }
+const mediaBinaryCache = new Map();
+const MEDIA_CACHE_TTL = 30 * 60 * 1000; // 30 min
+
+function cacheMediaBinary(convId, buffer, contentType) {
+  mediaBinaryCache.set(convId, { buffer, contentType, ts: Date.now() });
+}
+function getCachedMediaBinary(convId) {
+  const entry = mediaBinaryCache.get(convId);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > MEDIA_CACHE_TTL) { mediaBinaryCache.delete(convId); return null; }
+  return entry;
+}
+// Evict expired cached media every 10 min
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of mediaBinaryCache) {
+    if (now - entry.ts > MEDIA_CACHE_TTL) mediaBinaryCache.delete(id);
+  }
+}, 600000);
+
+// Background: download media from WhatsApp and cache it (fire-and-forget)
+async function cacheIncomingMedia(tenantId, convId, mediaId) {
+  try {
+    const result = await waManager.downloadMediaBinary(tenantId, mediaId);
+    if (result && result.buffer) {
+      cacheMediaBinary(convId, result.buffer, result.contentType);
+      console.log(`🖼️ Cached media for conv ${convId}: ${result.buffer.length} bytes (${result.contentType})`);
+    }
+  } catch (err) {
+    if (!isAbortError(err)) console.error(`⚠️ Background media cache failed for conv ${convId}:`, err.message);
+  }
+}
+
+// ── Auto-Reply Rules Cache (avoid DB query on every incoming message) ──
+// Maps tenantId -> { rules: [...], ts: number }
+const autoReplyCache = new Map();
+const AUTO_REPLY_CACHE_TTL = 60000; // 60s
+function getAutoReplyCached(tenantId) {
+  const c = autoReplyCache.get(String(tenantId));
+  if (c && (Date.now() - c.ts) < AUTO_REPLY_CACHE_TTL) return c.rules;
+  return null;
+}
+function setAutoReplyCache(tenantId, rules) {
+  autoReplyCache.set(String(tenantId), { rules, ts: Date.now() });
+}
+function invalidateAutoReplyCache(tenantId) {
+  autoReplyCache.delete(String(tenantId));
+}
+
+// ── Quick-Reply Cache (avoid DB query on every page load) ──
+const quickReplyCache = new Map();
+const QR_CACHE_TTL = 120000; // 2 min
+function getQuickReplyCached(tenantId) {
+  const c = quickReplyCache.get(String(tenantId));
+  if (c && (Date.now() - c.ts) < QR_CACHE_TTL) return c.data;
+  return null;
+}
+function setQuickReplyCache(tenantId, data) {
+  quickReplyCache.set(String(tenantId), { data, ts: Date.now() });
+}
+function invalidateQuickReplyCache(tenantId) {
+  quickReplyCache.delete(String(tenantId));
+}
+
 // ── Admin Notifications Store (in-memory) ──
 const adminNotifications = [];
 let notifIdCounter = 0;
@@ -185,6 +251,29 @@ class CloudAPIManager {
 
   async saveConfig(tenantId, phoneNumberId, accessToken, wabaId) {
     const tid = String(tenantId);
+
+    // ── FIX: Clear duplicate phone_number_id from other tenants ──
+    if (phoneNumberId) {
+      // Remove from any other tenant in-memory Map that has the same phone_number_id
+      for (const [otherTid, otherCfg] of this.configs) {
+        if (otherTid !== tid && otherCfg.phone_number_id === phoneNumberId) {
+          console.log(`⚠️  Removing duplicate phone_number_id ${phoneNumberId} from tenant ${otherTid} (now assigned to tenant ${tid})`);
+          this.configs.delete(otherTid);
+          // Also clear in DB for the old tenant
+          await supabase.from('tenants').update({
+            wa_phone_number_id: null, wa_access_token: null, wa_waba_id: null,
+            updated_at: new Date().toISOString()
+          }).eq('wa_phone_number_id', phoneNumberId).neq('id', tenantId);
+          break;
+        }
+      }
+      // Also clear any DB rows with this phone_number_id belonging to other tenants
+      // (covers cases where config wasn't loaded into memory yet)
+      await supabase.from('tenants').update({
+        wa_phone_number_id: null, wa_access_token: null, wa_waba_id: null,
+        updated_at: new Date().toISOString()
+      }).eq('wa_phone_number_id', phoneNumberId).neq('id', tenantId);
+    }
 
     const { error } = await supabase.from('tenants')
       .update({
@@ -273,6 +362,34 @@ class CloudAPIManager {
       return null;
     }
     return metaData.url;
+  }
+
+  // ── Download Media Binary from WhatsApp ────
+  async downloadMediaBinary(tenantId, mediaId) {
+    const cfg = this.getConfig(tenantId);
+    if (!cfg || !cfg.access_token) return null;
+
+    try {
+      // Step 1: Resolve media ID to download URL
+      const metaRes = await fetch(`https://graph.facebook.com/${GRAPH_API_VERSION}/${mediaId}`, {
+        headers: { 'Authorization': `Bearer ${cfg.access_token}` }
+      });
+      const metaData = await metaRes.json();
+      if (!metaRes.ok || !metaData.url) return null;
+
+      // Step 2: Download binary
+      const mediaRes = await fetch(metaData.url, {
+        headers: { 'Authorization': `Bearer ${cfg.access_token}` }
+      });
+      if (!mediaRes.ok) return null;
+
+      const contentType = mediaRes.headers.get('content-type') || 'application/octet-stream';
+      const buffer = Buffer.from(await mediaRes.arrayBuffer());
+      return { buffer, contentType };
+    } catch (err) {
+      console.error(`⚠️ downloadMediaBinary failed for ${mediaId}:`, err.message);
+      return null;
+    }
   }
 
   // ── Send Audio Message via Cloud API ───────
@@ -415,14 +532,98 @@ class CloudAPIManager {
     return data;
   }
 
+  // ── Upload Image to WhatsApp ───────────────
+  async uploadImageMedia(tenantId, imageBuffer, mimeType) {
+    const cfg = this.getConfig(tenantId);
+    if (!cfg || !cfg.phone_number_id || !cfg.access_token) {
+      throw new Error('WhatsApp Cloud API not configured for this tenant');
+    }
+
+    const cleanMime = mimeType.split(';')[0].trim();
+    const whatsappImageTypes = ['image/jpeg', 'image/png', 'image/webp'];
+    if (!whatsappImageTypes.includes(cleanMime)) {
+      throw new Error(`Unsupported image type: ${cleanMime}. Use JPEG, PNG, or WebP.`);
+    }
+
+    const blob = new Blob([imageBuffer], { type: cleanMime });
+    const ext = cleanMime === 'image/png' ? 'png' : cleanMime === 'image/webp' ? 'webp' : 'jpg';
+    const formData = new FormData();
+    formData.append('messaging_product', 'whatsapp');
+    formData.append('type', cleanMime);
+    formData.append('file', blob, `image.${ext}`);
+
+    const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${cfg.phone_number_id}/media`;
+    console.log(`🖼️ Uploading image: ${cleanMime}, ${imageBuffer.length} bytes`);
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${cfg.access_token}` },
+      body: formData
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      console.error('Image upload failed:', data);
+      throw new Error(data.error?.message || 'Image upload failed');
+    }
+    console.log(`🖼️ Image uploaded, ID: ${data.id}`);
+    return data.id;
+  }
+
+  // ── Send Image by Media ID ────────────────
+  async sendImageById(tenantId, to, mediaId, caption) {
+    const cfg = this.getConfig(tenantId);
+    if (!cfg || !cfg.phone_number_id || !cfg.access_token) {
+      throw new Error('WhatsApp Cloud API not configured for this tenant');
+    }
+
+    const cleanedTo = String(to).replace(/\D/g, '');
+    const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${cfg.phone_number_id}/messages`;
+
+    const imagePayload = { id: mediaId };
+    if (caption) imagePayload.caption = String(caption).substring(0, 1024);
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${cfg.access_token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: cleanedTo,
+        type: 'image',
+        image: imagePayload
+      })
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      const errCode = data.error?.code;
+      const errMsg = data.error?.message || data.error?.error_data?.details || JSON.stringify(data.error) || 'Cloud API error';
+      if (errCode === 131031 || errCode === 368 || errCode === 131026) {
+        this.markBanned(tenantId, `Error ${errCode}: ${errMsg}`);
+      }
+      throw new Error(errMsg);
+    }
+    return data;
+  }
+
   // ── Auto-Reply Check ──────────────────────
   async checkAutoReply(tenantId, phone, body, isNew) {
     try {
-      const { data: rules, error: rulesErr } = await supabase.from('auto_replies')
-        .select('*').eq('tenant_id', tenantId).eq('is_active', true)
-        .order('priority', { ascending: false });
+      // Use cached rules to avoid DB hit on every incoming message
+      let rules = getAutoReplyCached(tenantId);
+      if (!rules) {
+        const { data, error: rulesErr } = await supabase.from('auto_replies')
+          .select('*').eq('tenant_id', tenantId).eq('is_active', true)
+          .order('priority', { ascending: false });
+        if (rulesErr) { console.error('Auto-reply fetch error:', rulesErr.message); return; }
+        rules = data || [];
+        setAutoReplyCache(tenantId, rules);
+      }
 
-      if (rulesErr || !rules || rules.length === 0) return;
+      if (rules.length === 0) return;
       const lowerBody = body.toLowerCase();
 
       for (const rule of rules) {
@@ -580,6 +781,9 @@ async function handleIncomingWebhook(entry) {
 
     // Find the tenant that owns this phone_number_id
     let resolvedTenantId = waManager.findTenantByPhoneNumberId(phoneNumberId);
+    if (resolvedTenantId) {
+      console.log(`📡 Webhook: phone_number_id=${phoneNumberId} → tenant ${resolvedTenantId} (from memory)`);
+    }
     if (!resolvedTenantId) {
       // Try loading from DB in case config was added recently
       const { data: tenant, error: tenantErr } = await supabase.from('tenants')
@@ -615,13 +819,22 @@ async function handleIncomingWebhook(entry) {
         if (msg.type === 'text') {
           body = msg.text?.body || '';
         } else if (msg.type === 'image') {
-          body = msg.image?.caption || '[Image]';
+          body = msg.image?.caption ? `📷 ${msg.image.caption}` : '📷 Image';
+          incomingMediaId = msg.image?.id || null;
+          if (incomingMediaId) {
+            console.log(`🖼️ IMAGE RECEIVED from ${phone}: media_id=${incomingMediaId}`);
+          }
         } else if (msg.type === 'video') {
           body = msg.video?.caption || '[Video]';
         } else if (msg.type === 'audio' || msg.type === 'ptt') {
           body = '🎤 Voice message';
           incomingMediaId = (msg.audio?.id || msg.ptt?.id) || null;
-          console.log(`🎙️ AUDIO/PTT RECEIVED from ${phone}: type=${msg.type}, media_id=${incomingMediaId}`);
+          if (incomingMediaId) {
+            console.log(`🎙️ AUDIO/PTT RECEIVED from ${phone}: type=${msg.type}, media_id=${incomingMediaId}`);
+          } else {
+            console.warn(`⚠️ AUDIO/PTT from ${phone}: type=${msg.type} — no media ID found in payload`);
+            console.warn(`   audio=${JSON.stringify(msg.audio)}, ptt=${JSON.stringify(msg.ptt)}`);
+          }
         } else if (msg.type === 'document') {
           body = msg.document?.caption || `[Document: ${msg.document?.filename || 'file'}]`;
         } else if (msg.type === 'location') {
@@ -659,6 +872,10 @@ async function handleIncomingWebhook(entry) {
           }
         } else {
           console.log(`✅ Saved conversation id=${insertedRows?.[0]?.id}, media_url=${insertedRows?.[0]?.media_url || 'NULL'}`);
+          // Cache incoming media binary in background for fast proxy serving
+          if (incomingMediaId && insertedRows?.[0]?.id) {
+            cacheIncomingMedia(resolvedTenantId, insertedRows[0].id, incomingMediaId);
+          }
         }
 
         // Get contact name from webhook payload
@@ -742,11 +959,42 @@ const app = express();
 // Trust the first proxy hop (required when running behind Render, nginx, etc.)
 app.set('trust proxy', 1);
 
-app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+// Detect if we're behind a reverse proxy / on HTTPS so we can safely set
+// upgrade-insecure-requests and HSTS.  On plain HTTP localhost these headers
+// break the browser (all fetch calls get silently upgraded to https:// which
+// doesn't exist).
+const FORCE_HTTPS_HEADERS = process.env.FORCE_HTTPS === 'true' ||
+  process.env.RENDER === 'true';
+
+app.use(helmet({
+  contentSecurityPolicy: {
+    useDefaults: false,
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", "https://cdn.tailwindcss.com"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com", "https://cdn.tailwindcss.com"],
+      fontSrc: ["'self'", "https://fonts.gstatic.com"],
+      imgSrc: ["'self'", "blob:", "data:"],
+      connectSrc: ["'self'", "https://cdn.tailwindcss.com"],
+      frameSrc: ["'none'"],
+      frameAncestors: ["'self'"],
+      objectSrc: ["'none'"],
+      baseUri: ["'self'"],
+      formAction: ["'self'"],
+      ...(FORCE_HTTPS_HEADERS ? { upgradeInsecureRequests: [] } : {}),
+    }
+  },
+  crossOriginEmbedderPolicy: false,
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+  hsts: FORCE_HTTPS_HEADERS ? { maxAge: 31536000, includeSubDomains: true } : false,
+}));
 app.use(compression());
-app.use(express.json({ limit: '5mb' }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 app.use(cookieParser());
+
+// Security: prevent clickjacking, sniffing, and leaking server info
+app.disable('x-powered-by');
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, max: 50,
@@ -820,6 +1068,15 @@ function invalidateTenantCache(tenantId) {
   responseCache.delete(`active_chats_${tenantId}`);
   responseCache.delete(`stats_${tenantId}`);
   responseCache.delete('admin_tenants');
+  invalidateLeadsCache(tenantId);
+}
+
+// Bust all leads_<tid>_* cache entries for a tenant
+function invalidateLeadsCache(tenantId) {
+  const prefix = `leads_${tenantId}_`;
+  for (const key of responseCache.keys()) {
+    if (key.startsWith(prefix)) responseCache.delete(key);
+  }
 }
 
 // Evict expired tenantVerifyCache entries every 5 minutes
@@ -1170,16 +1427,35 @@ app.delete('/api/admin/tenants/:id', adminAuth, async (req, res) => {
 app.post('/api/admin/tenants/:id/configure-wa', adminAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    const { phone_number_id, access_token, waba_id } = req.body;
+    let { phone_number_id, access_token, waba_id } = req.body;
 
-    if (!phone_number_id || !access_token) {
-      return res.status(400).json({ error: 'Phone Number ID and Access Token are required' });
+    if (!phone_number_id) {
+      return res.status(400).json({ error: 'Phone Number ID is required' });
     }
 
     const { data: tenant } = await supabase.from('tenants')
-      .select('id, name, is_active').eq('id', id).maybeSingle();
+      .select('id, name, is_active, wa_access_token').eq('id', id).maybeSingle();
     if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
     if (!tenant.is_active) return res.status(400).json({ error: 'Tenant is deactivated' });
+
+    // Handle __keep_existing__ sentinel — reuse stored token
+    if (access_token === '__keep_existing__') {
+      if (!tenant.wa_access_token) {
+        return res.status(400).json({ error: 'No existing token found. Please provide an Access Token.' });
+      }
+      access_token = tenant.wa_access_token;
+    }
+
+    if (!access_token) {
+      return res.status(400).json({ error: 'Access Token is required' });
+    }
+
+    // Check if another tenant already uses this phone_number_id
+    const { data: duplicate } = await supabase.from('tenants')
+      .select('id, name').eq('wa_phone_number_id', phone_number_id).neq('id', id).maybeSingle();
+    if (duplicate) {
+      console.log(`⚠️  Phone Number ID ${phone_number_id} was assigned to tenant ${duplicate.id} (${duplicate.name}), will be reassigned to tenant ${id}`);
+    }
 
     // Verify the credentials work by calling the Graph API
     const testUrl = `https://graph.facebook.com/${GRAPH_API_VERSION}/${phone_number_id}`;
@@ -1196,10 +1472,14 @@ app.post('/api/admin/tenants/:id/configure-wa', adminAuth, async (req, res) => {
     await waManager.saveConfig(id, phone_number_id, access_token, waba_id || null);
 
     console.log(`✅ [Tenant ${id}] Cloud API configured (Phone ID: ${phone_number_id})`);
+    if (duplicate) {
+      console.log(`   ↳ Disconnected from tenant ${duplicate.id} (${duplicate.name})`);
+    }
     res.json({
       success: true, status: 'connected',
       phone_display: testData.display_phone_number || phone_number_id,
-      verified_name: testData.verified_name || null
+      verified_name: testData.verified_name || null,
+      reassigned_from: duplicate ? { id: duplicate.id, name: duplicate.name } : null
     });
   } catch (err) {
     console.error(`❌ Configure WA error for tenant ${req.params.id}:`, err.message);
@@ -1238,6 +1518,51 @@ app.post('/api/admin/tenants/:id/disconnect-wa', adminAuth, async (req, res) => 
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to disconnect WhatsApp' });
+  }
+});
+
+// ── Debug: Show all WA config mappings ──────
+app.get('/api/admin/wa-config-map', adminAuth, async (req, res) => {
+  try {
+    // In-memory state
+    const memoryMap = [];
+    for (const [tid, cfg] of waManager.configs) {
+      memoryMap.push({
+        tenant_id: tid,
+        phone_number_id: cfg.phone_number_id,
+        waba_id: cfg.waba_id || null,
+        banned: cfg.banned || false
+      });
+    }
+    // DB state
+    const { data: dbTenants, error } = await supabase.from('tenants')
+      .select('id, name, username, wa_phone_number_id, wa_waba_id, is_active')
+      .not('wa_phone_number_id', 'is', null)
+      .order('id', { ascending: true });
+    if (error) throw error;
+
+    // Check for duplicates
+    const phoneIdCounts = {};
+    for (const t of (dbTenants || [])) {
+      const pid = t.wa_phone_number_id;
+      if (!phoneIdCounts[pid]) phoneIdCounts[pid] = [];
+      phoneIdCounts[pid].push({ id: t.id, name: t.name, username: t.username });
+    }
+    const duplicates = Object.entries(phoneIdCounts)
+      .filter(([, tenants]) => tenants.length > 1)
+      .map(([phone_number_id, tenants]) => ({ phone_number_id, tenants }));
+
+    res.json({
+      memory_configs: memoryMap,
+      db_configs: (dbTenants || []).map(t => ({
+        tenant_id: t.id, name: t.name, username: t.username,
+        phone_number_id: t.wa_phone_number_id, is_active: t.is_active
+      })),
+      duplicates,
+      has_issues: duplicates.length > 0
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to get config map' });
   }
 });
 
@@ -1689,23 +2014,86 @@ app.post('/api/send-voice', tenantAuth, sendLimiter, upload.single('audio'), asy
   }
 });
 
-// ── Audio Proxy (stream WhatsApp media with auth) ────
-app.get('/api/audio-proxy/:conversationId', tenantAuth, async (req, res) => {
+// ── Send Image ──────────────────────────────
+app.post('/api/send-image', tenantAuth, sendLimiter, upload.single('image'), async (req, res) => {
+  try {
+    const phone = req.body.phone;
+    const caption = req.body.caption || '';
+    if (!phone) return res.status(400).json({ error: 'Phone is required' });
+    if (!req.file) return res.status(400).json({ error: 'Image file is required' });
+
+    if (!waManager.isReady(req.tenantId)) {
+      return res.status(503).json({ error: 'WhatsApp Cloud API not configured. Contact admin.' });
+    }
+
+    const cleanedPhone = phone.replace(/\D/g, '');
+    if (cleanedPhone.length < 10 || cleanedPhone.length > 15) {
+      return res.status(400).json({ error: 'Invalid phone number format' });
+    }
+
+    // Validate image type
+    const mimeType = req.file.mimetype || 'image/jpeg';
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp'];
+    if (!allowedTypes.includes(mimeType.split(';')[0].trim())) {
+      return res.status(400).json({ error: 'Only JPEG, PNG, and WebP images are supported' });
+    }
+
+    // Validate file size (WhatsApp limit: 5MB for images)
+    if (req.file.size > 5 * 1024 * 1024) {
+      return res.status(400).json({ error: 'Image too large. Max 5MB.' });
+    }
+
+    // Upload image to WhatsApp Media API
+    const mediaId = await waManager.uploadImageMedia(req.tenantId, req.file.buffer, mimeType);
+
+    // Send image message
+    await waManager.sendImageById(req.tenantId, cleanedPhone, mediaId, caption);
+
+    const now = new Date().toISOString();
+    const msgText = caption ? `📷 ${caption}` : '📷 Image';
+
+    await Promise.all([
+      supabase.from('conversations').insert({
+        tenant_id: req.tenantId, phone: cleanedPhone,
+        message: msgText,
+        direction: 'outgoing', status: 'sent',
+        media_url: 'wamid:' + mediaId
+      }),
+      supabase.from('leads')
+        .update({ last_message_at: now })
+        .eq('tenant_id', req.tenantId).eq('phone', cleanedPhone)
+    ]);
+
+    res.json({ success: true, phone: cleanedPhone, timestamp: now, media_url: 'wamid:' + mediaId });
+  } catch (err) {
+    console.error('Send image error:', err.message);
+    res.status(500).json({ error: err.message || 'Failed to send image' });
+  }
+});
+
+// ── Media Proxy (stream WhatsApp media with auth) ────
+// Handles both audio and image media
+app.get('/api/media-proxy/:conversationId', tenantAuth, async (req, res) => {
   try {
     const convId = parseInt(req.params.conversationId);
-    console.log(`🔊 Audio proxy request for conversation ${convId}, tenant ${req.tenantId}`);
     if (!convId) return res.status(400).json({ error: 'Invalid conversation ID' });
 
-    // Fetch the conversation to get media_url
+    // Check in-memory cache first (populated by cacheIncomingMedia on webhook)
+    const cached = getCachedMediaBinary(convId);
+    if (cached) {
+      res.set('Content-Type', cached.contentType);
+      res.set('Content-Length', cached.buffer.length);
+      res.set('Cache-Control', 'private, max-age=3600');
+      return res.send(cached.buffer);
+    }
+
     const { data: conv } = await supabase.from('conversations')
       .select('media_url')
       .eq('id', convId).eq('tenant_id', req.tenantId).maybeSingle();
 
     if (!conv || !conv.media_url) {
-      console.log(`🔊 No media_url found for conversation ${convId}`);
-      return res.status(404).json({ error: 'Audio not found' });
+      return res.status(404).json({ error: 'Media not found' });
     }
-    console.log(`🔊 media_url: ${conv.media_url}`);
 
     const cfg = waManager.getConfig(req.tenantId);
     if (!cfg || !cfg.access_token) {
@@ -1728,29 +2116,36 @@ app.get('/api/audio-proxy/:conversationId', tenantAuth, async (req, res) => {
       mediaUrl = metaData.url;
     }
 
-    // Download the actual audio binary from WhatsApp CDN
-    const audioRes = await fetch(mediaUrl, {
+    // Download the media binary from WhatsApp CDN
+    const mediaRes = await fetch(mediaUrl, {
       headers: { 'Authorization': `Bearer ${cfg.access_token}` }
     });
 
-    if (!audioRes.ok) {
-      return res.status(502).json({ error: 'Failed to download audio' });
+    if (!mediaRes.ok) {
+      return res.status(502).json({ error: 'Failed to download media' });
     }
 
-    // Stream the audio to the client
-    const contentType = audioRes.headers.get('content-type') || 'audio/ogg';
-    const arrayBuf = await audioRes.arrayBuffer();
-    const audioBuf = Buffer.from(arrayBuf);
-    console.log(`🔊 Proxying ${audioBuf.length} bytes, type: ${contentType}`);
+    const contentType = mediaRes.headers.get('content-type') || 'application/octet-stream';
+    const arrayBuf = await mediaRes.arrayBuffer();
+    const mediaBuf = Buffer.from(arrayBuf);
     res.set('Content-Type', contentType);
-    res.set('Content-Length', audioBuf.length);
-    res.set('Accept-Ranges', 'bytes');
+    res.set('Content-Length', mediaBuf.length);
     res.set('Cache-Control', 'private, max-age=3600');
-    res.send(audioBuf);
+    if (contentType.startsWith('audio/')) {
+      res.set('Accept-Ranges', 'bytes');
+    }
+    res.send(mediaBuf);
   } catch (err) {
-    console.error('Audio proxy error:', err.message);
-    res.status(500).json({ error: 'Failed to proxy audio' });
+    console.error('Media proxy error:', err.message);
+    res.status(500).json({ error: 'Failed to proxy media' });
   }
+});
+
+// ── Legacy audio-proxy route (backwards compatibility) ─
+app.get('/api/audio-proxy/:conversationId', tenantAuth, (req, res) => {
+  // Redirect to unified media proxy
+  const url = `/api/media-proxy/${req.params.conversationId}`;
+  res.redirect(307, url);
 });
 
 // ── Messages ────────────────────────────────
@@ -1786,6 +2181,9 @@ app.post('/api/messages/:phone/read', tenantAuth, async (req, res) => {
 app.get('/api/leads', tenantAuth, async (req, res) => {
   try {
     const { status, source } = req.query;
+    const cacheKey = `leads_${req.tenantId}_${status || 'all'}_${source || 'all'}`;
+    const cached = getCachedResponse(cacheKey);
+    if (cached) { res.set('Cache-Control', 'private, max-age=10'); return res.json(cached); }
     let query = supabase.from('leads').select('*')
       .eq('tenant_id', req.tenantId)
       .order('last_message_at', { ascending: false });
@@ -1793,7 +2191,9 @@ app.get('/api/leads', tenantAuth, async (req, res) => {
     if (source) query = query.eq('source', source);
     const { data, error } = await query;
     if (error) throw error;
-    res.json(data || []);
+    const result = data || [];
+    setCachedResponse(cacheKey, result, 15000); // 15s cache
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch leads' });
   }
@@ -1857,8 +2257,8 @@ app.post('/api/leads/:phone/resolve', tenantAuth, async (req, res) => {
 
 // ── In-memory response cache for heavy read endpoints ──
 const responseCache = new Map(); // key -> { data, ts }
-const RESP_CACHE_TTL = 30000; // 30s for stats (was 10s)
-const RESP_CACHE_TTL_LONG = 60000; // 60s for analytics (was 30s)
+const RESP_CACHE_TTL = 45000; // 45s for stats
+const RESP_CACHE_TTL_LONG = 90000; // 90s for analytics
 
 function getCachedResponse(key) {
   const cached = responseCache.get(key);
@@ -1885,28 +2285,35 @@ app.get('/api/stats', tenantAuth, async (req, res) => {
     const cached = getCachedResponse(cacheKey);
     if (cached) { res.set('Cache-Control', 'private, max-age=30'); return res.json(cached); }
 
-    // 2 queries instead of 9 — same data, 78% fewer Supabase API calls
+    // Use count queries instead of pulling all rows — saves massive bandwidth
     const since24h = new Date(Date.now() - 86400000).toISOString();
-    const [leadsData, msgsData] = await Promise.all([
-      supabase.from('leads').select('status, revenue').eq('tenant_id', tid),
-      supabase.from('conversations').select('direction').eq('tenant_id', tid).gte('created_at', since24h)
+    const [
+      totalLeads, newLeads, soldLeads, interestedLeads, contactedLeads, lostLeads,
+      revenueData, msgsToday, incomingToday, outgoingToday
+    ] = await Promise.all([
+      supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid),
+      supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('status', 'new'),
+      supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('status', 'sold'),
+      supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('status', 'interested'),
+      supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('status', 'contacted'),
+      supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('status', 'lost'),
+      supabase.from('leads').select('revenue').eq('tenant_id', tid).gt('revenue', 0),
+      supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).gte('created_at', since24h),
+      supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('direction', 'incoming').gte('created_at', since24h),
+      supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('direction', 'outgoing').gte('created_at', since24h),
     ]);
-    if (leadsData.error) throw leadsData.error;
-
-    const leads = leadsData.data || [];
-    const msgs = msgsData.data || [];
 
     const result = {
-      total_leads: leads.length,
-      new_leads: leads.filter(l => l.status === 'new').length,
-      sold_leads: leads.filter(l => l.status === 'sold').length,
-      interested_leads: leads.filter(l => l.status === 'interested').length,
-      contacted_leads: leads.filter(l => l.status === 'contacted').length,
-      lost_leads: leads.filter(l => l.status === 'lost').length,
-      total_revenue: leads.reduce((sum, l) => sum + (parseFloat(l.revenue) || 0), 0),
-      messages_today: msgs.length,
-      incoming_today: msgs.filter(m => m.direction === 'incoming').length,
-      outgoing_today: msgs.filter(m => m.direction === 'outgoing').length
+      total_leads: totalLeads.count || 0,
+      new_leads: newLeads.count || 0,
+      sold_leads: soldLeads.count || 0,
+      interested_leads: interestedLeads.count || 0,
+      contacted_leads: contactedLeads.count || 0,
+      lost_leads: lostLeads.count || 0,
+      total_revenue: (revenueData.data || []).reduce((sum, l) => sum + (parseFloat(l.revenue) || 0), 0),
+      messages_today: msgsToday.count || 0,
+      incoming_today: incomingToday.count || 0,
+      outgoing_today: outgoingToday.count || 0
     };
     setCachedResponse(cacheKey, result);
     res.set('Cache-Control', 'private, max-age=30');
@@ -1946,6 +2353,8 @@ app.get('/api/stats/trends', tenantAuth, async (req, res) => {
 // ── Quick Replies CRUD ──────────────────────
 app.get('/api/quick-replies', tenantAuth, async (req, res) => {
   try {
+    const cached = getQuickReplyCached(req.tenantId);
+    if (cached) return res.json(cached);
     const { data, error } = await supabase.from('quick_replies')
       .select('*').eq('tenant_id', req.tenantId).order('id');
     if (error) throw error;
@@ -1954,6 +2363,7 @@ app.get('/api/quick-replies', tenantAuth, async (req, res) => {
       if (seen.has(r.title)) return false;
       seen.add(r.title); return true;
     });
+    setQuickReplyCache(req.tenantId, unique);
     res.json(unique);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch quick replies' });
@@ -1972,6 +2382,7 @@ app.post('/api/quick-replies', tenantAuth, async (req, res) => {
       shortcut: shortcut ? String(shortcut).substring(0, 30) : null
     }).select().single();
     if (error) throw error;
+    invalidateQuickReplyCache(req.tenantId);
     res.json(data);
   } catch (err) {
     res.status(500).json({ error: 'Failed to create quick reply' });
@@ -1990,6 +2401,7 @@ app.put('/api/quick-replies/:id', tenantAuth, async (req, res) => {
     const { data, error } = await supabase.from('quick_replies')
       .update(updates).eq('id', id).eq('tenant_id', req.tenantId).select().single();
     if (error) throw error;
+    invalidateQuickReplyCache(req.tenantId);
     res.json(data);
   } catch (err) {
     res.status(500).json({ error: 'Failed to update quick reply' });
@@ -2000,6 +2412,7 @@ app.delete('/api/quick-replies/:id', tenantAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
     await supabase.from('quick_replies').delete().eq('id', id).eq('tenant_id', req.tenantId);
+    invalidateQuickReplyCache(req.tenantId);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete quick reply' });
@@ -2035,6 +2448,7 @@ app.post('/api/auto-replies', tenantAuth, async (req, res) => {
       priority: parseInt(priority) || 0
     }).select().single();
     if (error) throw error;
+    invalidateAutoReplyCache(req.tenantId);
     res.json(data);
   } catch (err) {
     res.status(500).json({ error: 'Failed to create auto-reply' });
@@ -2055,6 +2469,7 @@ app.put('/api/auto-replies/:id', tenantAuth, async (req, res) => {
     const { data, error } = await supabase.from('auto_replies')
       .update(updates).eq('id', id).eq('tenant_id', req.tenantId).select().single();
     if (error) throw error;
+    invalidateAutoReplyCache(req.tenantId);
     res.json(data);
   } catch (err) {
     res.status(500).json({ error: 'Failed to update auto-reply' });
@@ -2065,6 +2480,7 @@ app.delete('/api/auto-replies/:id', tenantAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
     await supabase.from('auto_replies').delete().eq('id', id).eq('tenant_id', req.tenantId);
+    invalidateAutoReplyCache(req.tenantId);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete auto-reply' });
@@ -2345,6 +2761,110 @@ app.get('/api/leads/export', tenantAuth, async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════
+// REALTIME — Supabase subscription → SSE push
+// ══════════════════════════════════════════════
+
+// Map of tenantId -> Set of SSE response objects (one per open browser tab)
+const sseClients = new Map(); // tenantId -> Set<res>
+
+function addSseClient(tenantId, res) {
+  if (!sseClients.has(tenantId)) sseClients.set(tenantId, new Set());
+  sseClients.get(tenantId).add(res);
+}
+
+function removeSseClient(tenantId, res) {
+  const s = sseClients.get(tenantId);
+  if (s) { s.delete(res); if (s.size === 0) sseClients.delete(tenantId); }
+}
+
+function broadcastToTenant(tenantId, event, data) {
+  const clients = sseClients.get(tenantId);
+  if (!clients || clients.size === 0) return;
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of clients) {
+    try { res.write(payload); } catch (_) { removeSseClient(tenantId, res); }
+  }
+}
+
+// Single global Supabase realtime channel for all tenants
+let realtimeChannel = null;
+
+function startRealtimeSubscription() {
+  if (realtimeChannel) return; // already running
+
+  realtimeChannel = supabase
+    .channel('crm-conversations')
+    .on(
+      'postgres_changes',
+      { event: 'INSERT', schema: 'public', table: 'conversations' },
+      (payload) => {
+        const row = payload.new;
+        if (!row || !row.tenant_id) return;
+        const tenantId = row.tenant_id;
+
+        // Only push if someone is connected for this tenant
+        if (!sseClients.has(tenantId)) return;
+
+        console.log(`⚡ Realtime: new message for tenant ${tenantId} from ${row.phone}`);
+
+        // Push two events:
+        // 1. 'new_message'  → frontend reloads the chat window if it matches
+        // 2. 'chat_updated' → frontend refreshes the chat list
+        broadcastToTenant(tenantId, 'new_message', {
+          phone: row.phone,
+          direction: row.direction,
+          message: row.message,
+          media_url: row.media_url || null,
+          created_at: row.created_at,
+          id: row.id
+        });
+        broadcastToTenant(tenantId, 'chat_updated', { phone: row.phone });
+      }
+    )
+    .subscribe((status) => {
+      if (status === 'SUBSCRIBED') {
+        console.log('✅ Supabase Realtime subscription active');
+      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+        console.warn(`⚠️  Supabase Realtime: ${status} — will retry`);
+        realtimeChannel = null;
+        // Retry after 10 seconds
+        setTimeout(startRealtimeSubscription, 10000);
+      }
+    });
+}
+
+// ── SSE Endpoint ─────────────────────────────
+app.get('/api/events', tenantAuth, (req, res) => {
+  const tenantId = req.tenantId;
+
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no' // disable nginx buffering
+  });
+  res.flushHeaders();
+
+  // Send a heartbeat immediately so browser knows the connection is alive
+  res.write('event: connected\ndata: {}\n\n');
+
+  addSseClient(tenantId, res);
+
+  // Send heartbeat every 25s to prevent proxy timeouts
+  const heartbeat = setInterval(() => {
+    try { res.write(':heartbeat\n\n'); } catch (_) { clearInterval(heartbeat); }
+  }, 25000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    removeSseClient(tenantId, res);
+  });
+
+  // Ensure Realtime subscription is running
+  startRealtimeSubscription();
+});
+
 // ── Active Chats (OPTIMIZED: 3 queries instead of N*2+1) ────
 app.get('/api/active-chats', tenantAuth, async (req, res) => {
   try {
@@ -2365,7 +2885,7 @@ app.get('/api/active-chats', tenantAuth, async (req, res) => {
     if (since) {
       leadsQuery = leadsQuery.gte('last_message_at', since);
     }
-    leadsQuery = leadsQuery.order('last_message_at', { ascending: false }).limit(200);
+    leadsQuery = leadsQuery.order('last_message_at', { ascending: false }).limit(500);
 
     const { data: leads, error } = await leadsQuery;
     if (error) throw error;
@@ -2413,7 +2933,7 @@ app.get('/api/active-chats', tenantAuth, async (req, res) => {
       unread_count: unreadMap.get(lead.phone) || 0
     }));
 
-    if (!since) setCachedResponse(`active_chats_${tid}`, chats, 5000);
+    if (!since) setCachedResponse(`active_chats_${tid}`, chats, 10000);
     res.json(chats);
   } catch (err) {
     console.error('Active chats error:', err.message);
@@ -2425,7 +2945,7 @@ app.get('/api/active-chats', tenantAuth, async (req, res) => {
 // PAGE ROUTES
 // ══════════════════════════════════════════════
 app.use(express.static(path.join(__dirname, 'public'), {
-  maxAge: '1h',
+  maxAge: '4h',
   etag: true,
   lastModified: true
 }));
@@ -2504,6 +3024,63 @@ app.get('*', (req, res) => {
   res.redirect('/');
 });
 
+// ── Startup DB Migrations ─────────────────────
+async function runStartupMigrations() {
+  // ── 1. Ensure media_url column exists ──────
+  try {
+    const { error } = await supabase.from('conversations').select('media_url').limit(0);
+    if (error) {
+      const isMissing = error.code === '42703' ||
+        (error.message && error.message.toLowerCase().includes('media_url'));
+      if (isMissing) {
+        console.warn('⚠️  conversations.media_url column missing — auto-migrating...');
+        const { error: rpcErr } = await supabase.rpc('exec_sql', {
+          sql: 'ALTER TABLE conversations ADD COLUMN IF NOT EXISTS media_url TEXT;'
+        });
+        if (!rpcErr) {
+          console.log('✅ Migration: media_url column added.');
+        } else {
+          console.error('❌ Auto-migration failed. Run in Supabase SQL Editor:');
+          console.error('   ALTER TABLE conversations ADD COLUMN IF NOT EXISTS media_url TEXT;');
+        }
+      }
+    }
+  } catch (err) {
+    if (!isAbortError(err)) console.warn('⚠️  Could not verify DB schema (media_url):', err.message);
+  }
+
+  // ── 2. Enable Realtime on conversations table ──
+  try {
+    const { error: rtErr } = await supabase.rpc('exec_sql', {
+      sql: `
+        DO $$
+        BEGIN
+          -- Add conversations to supabase_realtime publication if not already present
+          IF NOT EXISTS (
+            SELECT 1 FROM pg_publication_tables
+            WHERE pubname = 'supabase_realtime'
+              AND schemaname = 'public'
+              AND tablename = 'conversations'
+          ) THEN
+            ALTER PUBLICATION supabase_realtime ADD TABLE public.conversations;
+            RAISE NOTICE 'conversations added to supabase_realtime';
+          END IF;
+        END$$;
+      `
+    });
+    if (!rtErr) {
+      console.log('✅ Realtime publication: conversations table enabled.');
+    } else {
+      // Non-fatal — realtime just won't push; polling fallback still works
+      console.warn('⚠️  Could not auto-enable Realtime publication:', rtErr.message);
+      console.warn('   To fix manually: run in Supabase SQL Editor:');
+      console.warn('   ALTER PUBLICATION supabase_realtime ADD TABLE public.conversations;');
+    }
+  } catch (err) {
+    if (!isAbortError(err)) console.warn('⚠️  Could not verify Realtime publication:', err.message);
+  }
+}
+
 // ══════════════════════════════════════════════
 // START SERVER
 // ══════════════════════════════════════════════
@@ -2519,6 +3096,7 @@ const server = app.listen(PORT, () => {
   console.log('╚══════════════════════════════════════════════════╝');
   console.log('');
 
+  runStartupMigrations().catch(() => {});
   initAllTenants();
 });
 

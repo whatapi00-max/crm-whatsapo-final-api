@@ -25,7 +25,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
 </head>
-<body class="dark:bg-dark-900 bg-gray-50 font-['Inter'] text-gray-800 dark:text-gray-100 h-screen overflow-hidden">
+<body class="dark:bg-dark-900 bg-gray-50 text-gray-800 dark:text-gray-100 h-screen overflow-hidden" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;">
 
   <div class="flex h-screen">
 
@@ -230,6 +230,10 @@
                       <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg>
                       <span class="hidden sm:inline">Send</span>
                     </button>
+                    <button id="image-btn" class="p-2.5 rounded-xl hover:bg-white/5 text-gray-500 hover:text-wa-green transition-all flex-shrink-0" title="Send image">
+                      <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+                    </button>
+                    <input type="file" id="image-file-input" class="hidden" accept="image/jpeg,image/png,image/webp">
                     <button id="voice-btn" class="p-2.5 rounded-xl hover:bg-white/5 text-gray-500 hover:text-wa-green transition-all flex-shrink-0" title="Record voice message">
                       <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4M12 15a3 3 0 003-3V5a3 3 0 00-6 0v7a3 3 0 003 3z"/></svg>
                     </button>
@@ -251,6 +255,21 @@
                       <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
                     </button>
                     <button id="voice-send-btn" class="px-3 py-1.5 bg-wa-green rounded-lg text-white text-xs font-medium hover:bg-wa-green/80" title="Send voice">
+                      <svg class="w-4 h-4 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg> Send
+                    </button>
+                  </div>
+                  <!-- Image Preview Bar -->
+                  <div id="image-preview-bar" class="hidden mt-2 flex items-center gap-3 p-2 rounded-xl bg-blue-500/10 border border-blue-500/20">
+                    <img id="image-preview-thumb" class="w-12 h-12 rounded-lg object-cover flex-shrink-0" src="" alt="Preview">
+                    <div class="flex-1 min-w-0">
+                      <p class="text-xs font-medium text-gray-700 dark:text-gray-300 truncate" id="image-preview-name">image.jpg</p>
+                      <p class="text-[10px] text-gray-500" id="image-preview-size">0 KB</p>
+                    </div>
+                    <input id="image-caption-input" class="flex-1 bg-transparent border border-gray-200 dark:border-white/10 rounded-lg px-2 py-1 text-xs outline-none placeholder-gray-400 text-gray-900 dark:text-gray-100" placeholder="Add caption (optional)" maxlength="1024">
+                    <button id="image-cancel-btn" class="p-1.5 rounded-lg hover:bg-red-500/20 text-red-400" title="Cancel">
+                      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                    </button>
+                    <button id="image-send-btn" class="px-3 py-1.5 bg-wa-green rounded-lg text-white text-xs font-medium hover:bg-wa-green/80" title="Send image">
                       <svg class="w-4 h-4 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg> Send
                     </button>
                   </div>
@@ -537,7 +556,7 @@
           <div class="p-6 max-w-4xl mx-auto">
             <div class="mb-8">
               <h2 class="text-xl font-bold">Feature Guide</h2>
-              <p class="text-xs text-gray-500 mt-1">Complete guide on how every feature works in Billy777 WhatsApp CRM</p>
+              <p class="text-xs text-gray-500 mt-1">Complete guide to Billy777 WhatsApp CRM — Cloud API Edition</p>
             </div>
             <div class="space-y-5" id="guide-content">
 
@@ -545,13 +564,14 @@
               <details class="guide-section rounded-2xl border border-gray-200 dark:border-white/5 bg-white dark:bg-dark-800/30 overflow-hidden" open>
                 <summary class="p-5 cursor-pointer flex items-center gap-3 hover:bg-gray-50 dark:hover:bg-white/[0.02] transition-colors">
                   <span class="w-8 h-8 rounded-lg bg-wa-green/15 text-wa-green flex items-center justify-center flex-shrink-0 text-sm font-bold">1</span>
-                  <span class="text-sm font-semibold text-gray-800 dark:text-gray-200">Getting Started — Connect WhatsApp</span>
+                  <span class="text-sm font-semibold text-gray-800 dark:text-gray-200">Getting Started — Login & Dashboard</span>
                 </summary>
                 <div class="px-5 pb-5 text-xs text-gray-600 dark:text-gray-400 space-y-2 border-t border-gray-100 dark:border-white/5 pt-4">
-                  <p><strong>Step 1:</strong> Start the server with <code class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-white/5 text-xs">node server.js</code> from the project folder.</p>
-                  <p><strong>Step 2:</strong> Open <code class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-white/5 text-xs">http://localhost:3000</code> in your browser.</p>
-                  <p><strong>Step 3:</strong> Your admin will connect your WhatsApp via QR code scan or pairing code. Open WhatsApp on your phone → Settings → Linked Devices → Link a Device → Scan QR or use "Link with phone number instead" for pairing code.</p>
-                  <p><strong>Step 4:</strong> Once scanned, the bottom-left dot turns <span class="text-wa-green font-semibold">green</span> and shows "Connected".</p>
+                  <p><strong>Login:</strong> Open the CRM link provided by your admin. Enter your username and password on the login page.</p>
+                  <p><strong>Dashboard:</strong> After login you'll land on the Team Inbox — your main workspace. The left sidebar has all navigation.</p>
+                  <p><strong>Connection Status:</strong> The bottom-left corner shows a <span class="text-wa-green font-semibold">green dot</span> when WhatsApp Cloud API is connected and active.</p>
+                  <p><strong>Your Account:</strong> Your name appears in the top-right corner. Click the logout icon to sign out securely.</p>
+                  <p class="text-accent-blue"><strong>ℹ️ Note:</strong> This CRM uses the official WhatsApp Cloud API — no QR code scanning required. Your admin configures the API connection.</p>
                 </div>
               </details>
 
@@ -562,138 +582,158 @@
                   <span class="text-sm font-semibold text-gray-800 dark:text-gray-200">Team Inbox — Chat with Contacts</span>
                 </summary>
                 <div class="px-5 pb-5 text-xs text-gray-600 dark:text-gray-400 space-y-2 border-t border-gray-100 dark:border-white/5 pt-4">
-                  <p><strong>Chat List (Left Panel):</strong> Shows all your WhatsApp conversations. Each contact displays their name, last message, timestamp, status badge, and unread count.</p>
-                  <p><strong>Filter Tabs:</strong> Filter contacts by status — All, New, Contacted, Interested.</p>
-                  <p><strong>Search:</strong> Type in the search bar to find contacts by name, phone number, or last message.</p>
-                  <p><strong>Chat Panel (Center):</strong> Click any contact to open their full chat. Messages appear in real-time with WhatsApp-style bubbles. Use the ← back button to return to the list.</p>
-                  <p><strong>Send Messages:</strong> Type your message and click Send (or press Enter). Character limit is 4,096.</p>
-                  <p><strong>Quick Replies:</strong> Click the ⚡ bolt icon to show saved quick reply buttons above the input — click one to instantly send it.</p>
-                  <p><strong>Status Dropdown:</strong> Change a contact's stage (New → Contacted → Interested) from the chat header dropdown.</p>
-                  <p><strong>Contact Info (Right Panel):</strong> Click the ℹ️ icon to open/close the contact detail panel. Edit name, phone, email, company, source, tags, and notes. Click "Save Changes".</p>
-                  <p><strong>Schedule Message:</strong> Click the 🕐 clock icon to schedule a message for a specific date/time.</p>
+                  <p><strong>Chat List (Left Panel):</strong> Shows all conversations sorted by most recent. Each contact displays name, phone, last message preview, timestamp, unread count, and status badge.</p>
+                  <p><strong>Filter Tabs:</strong> Quickly filter by status — <span class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-white/5">All</span> <span class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-white/5">Unread</span> <span class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-white/5">New</span> <span class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-white/5">Contacted</span> <span class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-white/5">Interested</span></p>
+                  <p><strong>Search:</strong> Use the search bar to find contacts by name, phone number, or message content.</p>
+                  <p><strong>Chat Panel:</strong> Click any contact to open the full conversation. Messages appear in real-time with WhatsApp-style bubbles.</p>
+                  <p><strong>Send Text:</strong> Type your message and press Enter or click Send. Max 4,096 characters per message.</p>
+                  <p><strong>Send Images:</strong> Click the 📷 camera icon → select a JPEG, PNG, or WebP image → optionally add a caption → click Send. Image preview shown before sending.</p>
+                  <p><strong>Quick Replies:</strong> Click the ⚡ bolt icon to reveal saved quick reply buttons — click any to send instantly.</p>
+                  <p><strong>Schedule Message:</strong> Click the 🕐 clock icon to schedule a message for a future date and time.</p>
+                  <p><strong>Status:</strong> Change a contact's stage from the dropdown in the chat header (New → Contacted → Interested → Sold).</p>
+                  <p><strong>Contact Info:</strong> Click the ℹ️ icon to open the detail panel — edit name, email, company, source, tags, notes, and revenue.</p>
+                  <p><strong>Real-time:</strong> New incoming messages appear instantly via real-time push — no need to refresh.</p>
                 </div>
               </details>
 
-              <!-- 3. Contacts -->
+              <!-- 3. Media Messages -->
               <details class="guide-section rounded-2xl border border-gray-200 dark:border-white/5 bg-white dark:bg-dark-800/30 overflow-hidden">
                 <summary class="p-5 cursor-pointer flex items-center gap-3 hover:bg-gray-50 dark:hover:bg-white/[0.02] transition-colors">
-                  <span class="w-8 h-8 rounded-lg bg-accent-purple/15 text-accent-purple flex items-center justify-center flex-shrink-0 text-sm font-bold">3</span>
+                  <span class="w-8 h-8 rounded-lg bg-accent-cyan/15 text-accent-cyan flex items-center justify-center flex-shrink-0 text-sm font-bold">3</span>
+                  <span class="text-sm font-semibold text-gray-800 dark:text-gray-200">Media — Images, Videos & Voice</span>
+                </summary>
+                <div class="px-5 pb-5 text-xs text-gray-600 dark:text-gray-400 space-y-2 border-t border-gray-100 dark:border-white/5 pt-4">
+                  <p><strong>Send Images:</strong> In any chat, click the 📷 icon next to the message input. Select an image file (JPEG, PNG, or WebP, max 5MB). A preview bar appears — add an optional caption, then click Send.</p>
+                  <p><strong>Receive Images:</strong> Incoming photos display as thumbnails inside chat bubbles. Click any thumbnail to view it full-screen. Click anywhere or × to close.</p>
+                  <p><strong>Receive Videos:</strong> Incoming videos show a 🎥 Video placeholder. Video playback support coming soon.</p>
+                  <p><strong>Voice Messages:</strong> Incoming voice notes show a built-in audio player with play/pause, progress bar, and duration.</p>
+                  <p><strong>Chat List Preview:</strong> Media messages show clean previews — 📷 Photo, 🎥 Video, 🎤 Voice message — instead of raw brackets.</p>
+                  <p class="text-amber-500"><strong>⚠️ Note:</strong> Media files are loaded securely through the server proxy — images are never exposed directly.</p>
+                </div>
+              </details>
+
+              <!-- 4. Contacts -->
+              <details class="guide-section rounded-2xl border border-gray-200 dark:border-white/5 bg-white dark:bg-dark-800/30 overflow-hidden">
+                <summary class="p-5 cursor-pointer flex items-center gap-3 hover:bg-gray-50 dark:hover:bg-white/[0.02] transition-colors">
+                  <span class="w-8 h-8 rounded-lg bg-accent-purple/15 text-accent-purple flex items-center justify-center flex-shrink-0 text-sm font-bold">4</span>
                   <span class="text-sm font-semibold text-gray-800 dark:text-gray-200">Contacts — Manage Your Database</span>
                 </summary>
                 <div class="px-5 pb-5 text-xs text-gray-600 dark:text-gray-400 space-y-2 border-t border-gray-100 dark:border-white/5 pt-4">
-                  <p><strong>Contacts Table:</strong> View all contacts in a table with name, phone, status, source, tags, and last active time.</p>
-                  <p><strong>Stats Row:</strong> Quick overview showing Total contacts, New, Contacted, Interested, and Sold counts.</p>
-                  <p><strong>Import CSV:</strong> Click "Import CSV" → Paste CSV data in the format: <code class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-white/5">phone,name,email,company,tags</code> → Click "Import".</p>
-                  <p><strong>Export CSV:</strong> Click "Export" to download all contacts as a CSV file.</p>
-                  <p><strong>Click any row</strong> to jump directly to that contact's chat in the Team Inbox.</p>
+                  <p><strong>Contacts Table:</strong> View all contacts with name, phone, status, source, tags, and last active time.</p>
+                  <p><strong>Stats Row:</strong> Quick overview — Total contacts, New, Contacted, Interested, and Sold counts.</p>
+                  <p><strong>Import CSV:</strong> Click "Import CSV" → paste data in format: <code class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-white/5">phone,name,email,company,tags</code> → Click Import.</p>
+                  <p><strong>Export CSV:</strong> Click "Export" to download all contacts as a CSV file for backup or external use.</p>
+                  <p><strong>Quick Navigate:</strong> Click any row to jump directly to that contact's chat in the Team Inbox.</p>
                 </div>
               </details>
 
-              <!-- 4. Broadcasts -->
+              <!-- 5. Broadcasts -->
               <details class="guide-section rounded-2xl border border-gray-200 dark:border-white/5 bg-white dark:bg-dark-800/30 overflow-hidden">
                 <summary class="p-5 cursor-pointer flex items-center gap-3 hover:bg-gray-50 dark:hover:bg-white/[0.02] transition-colors">
-                  <span class="w-8 h-8 rounded-lg bg-accent-orange/15 text-accent-orange flex items-center justify-center flex-shrink-0 text-sm font-bold">4</span>
+                  <span class="w-8 h-8 rounded-lg bg-accent-orange/15 text-accent-orange flex items-center justify-center flex-shrink-0 text-sm font-bold">5</span>
                   <span class="text-sm font-semibold text-gray-800 dark:text-gray-200">Broadcasts — Bulk Messaging Campaigns</span>
                 </summary>
                 <div class="px-5 pb-5 text-xs text-gray-600 dark:text-gray-400 space-y-2 border-t border-gray-100 dark:border-white/5 pt-4">
-                  <p><strong>Create Campaign:</strong> Click "New Broadcast" → Enter a campaign name, select target audience (All Contacts, New Leads, Contacted, Interested, or Sold), then write your message.</p>
-                  <p><strong>Send:</strong> After creating, click the green "Send" button on the campaign card. Messages are sent with random delays between each recipient to reduce the risk of blocks.</p>
-                  <p><strong>Track Progress:</strong> Each card shows status (Draft / Sending / Completed / Failed), recipient count, and delivered/failed stats.</p>
-                  <p><strong>Delete:</strong> Click "Delete" on any campaign card to remove it.</p>
-                  <p class="text-amber-500"><strong>⚠️ Tip:</strong> Avoid sending to very large groups at once. The built-in delays help, but sending natural, relevant messages is the best protection.</p>
+                  <p><strong>Create Campaign:</strong> Click "New Broadcast" → name your campaign, select audience (All, New, Contacted, Interested, or Sold), then write your message.</p>
+                  <p><strong>Send:</strong> Click the green Send button on a campaign card. Messages send with smart random delays between recipients to stay safe.</p>
+                  <p><strong>Track Progress:</strong> Each card shows real-time status — Draft, Sending, Completed, or Failed — with delivered/failed counts.</p>
+                  <p><strong>Delete:</strong> Remove any campaign by clicking Delete on its card.</p>
+                  <p class="text-amber-500"><strong>⚠️ Best Practice:</strong> Keep broadcast groups under 500 contacts. Send relevant, personalized messages to maintain high delivery rates.</p>
                 </div>
               </details>
 
-              <!-- 5. Automation -->
+              <!-- 6. Automation -->
               <details class="guide-section rounded-2xl border border-gray-200 dark:border-white/5 bg-white dark:bg-dark-800/30 overflow-hidden">
                 <summary class="p-5 cursor-pointer flex items-center gap-3 hover:bg-gray-50 dark:hover:bg-white/[0.02] transition-colors">
-                  <span class="w-8 h-8 rounded-lg bg-accent-pink/15 text-accent-pink flex items-center justify-center flex-shrink-0 text-sm font-bold">5</span>
+                  <span class="w-8 h-8 rounded-lg bg-accent-pink/15 text-accent-pink flex items-center justify-center flex-shrink-0 text-sm font-bold">6</span>
                   <span class="text-sm font-semibold text-gray-800 dark:text-gray-200">Automation — Auto-Reply Rules</span>
                 </summary>
                 <div class="px-5 pb-5 text-xs text-gray-600 dark:text-gray-400 space-y-2 border-t border-gray-100 dark:border-white/5 pt-4">
-                  <p><strong>Create Rule:</strong> Click "New Rule" → Enter a name, trigger type, priority, trigger value, and reply message.</p>
+                  <p><strong>Create Rule:</strong> Click "New Rule" → set a name, trigger type, priority, trigger value, and reply message.</p>
                   <p><strong>Trigger Types:</strong></p>
                   <ul class="list-disc list-inside space-y-1 ml-2">
-                    <li><strong>Contains Keyword:</strong> Triggers if the incoming message contains any of the comma-separated keywords.</li>
-                    <li><strong>Exact Match:</strong> Triggers only if the message exactly matches the keyword.</li>
-                    <li><strong>First Message:</strong> Triggers automatically when a new contact sends their very first message.</li>
-                    <li><strong>Regex:</strong> Triggers if the message matches a regular expression pattern.</li>
+                    <li><strong>Contains Keyword:</strong> Fires when a message contains any listed keyword (comma-separated).</li>
+                    <li><strong>Exact Match:</strong> Fires only when the message exactly matches the keyword.</li>
+                    <li><strong>First Message:</strong> Fires when a new contact sends their first-ever message — great for welcome messages.</li>
+                    <li><strong>Regex:</strong> Fires when the message matches a regular expression pattern — for advanced matching.</li>
                   </ul>
-                  <p><strong>Priority:</strong> When multiple rules match, the one with the highest priority number fires first.</p>
-                  <p><strong>Toggle On/Off:</strong> Use the toggle switch on each rule card to enable/disable it without deleting.</p>
-                  <p><strong>Edit/Delete:</strong> Click "Edit" to modify or "Delete" to remove a rule.</p>
+                  <p><strong>Priority:</strong> Higher number = fires first when multiple rules match the same message.</p>
+                  <p><strong>Toggle:</strong> Enable/disable any rule with the switch — no need to delete and recreate.</p>
+                  <p><strong>Performance:</strong> Rules are cached in memory for instant matching — no delay even with hundreds of rules.</p>
                 </div>
               </details>
 
-              <!-- 6. Analytics -->
+              <!-- 7. Analytics -->
               <details class="guide-section rounded-2xl border border-gray-200 dark:border-white/5 bg-white dark:bg-dark-800/30 overflow-hidden">
                 <summary class="p-5 cursor-pointer flex items-center gap-3 hover:bg-gray-50 dark:hover:bg-white/[0.02] transition-colors">
-                  <span class="w-8 h-8 rounded-lg bg-amber-500/15 text-amber-500 flex items-center justify-center flex-shrink-0 text-sm font-bold">6</span>
+                  <span class="w-8 h-8 rounded-lg bg-amber-500/15 text-amber-500 flex items-center justify-center flex-shrink-0 text-sm font-bold">7</span>
                   <span class="text-sm font-semibold text-gray-800 dark:text-gray-200">Analytics — Dashboard & Insights</span>
                 </summary>
                 <div class="px-5 pb-5 text-xs text-gray-600 dark:text-gray-400 space-y-2 border-t border-gray-100 dark:border-white/5 pt-4">
-                  <p><strong>Stat Cards:</strong> Quick overview of Total Leads, New, Sold, Messages Today, Incoming Today, and Total Revenue.</p>
-                  <p><strong>Lead Pipeline:</strong> Visual bar chart showing how many contacts are in each stage — New, Contacted, Interested, Sold, Lost.</p>
-                  <p><strong>Message Trends:</strong> Bar chart of messages over the last 7 days.</p>
-                  <p>All data refreshes automatically every 5 seconds.</p>
+                  <p><strong>Stat Cards:</strong> Quick overview — Total Leads, New Leads, Sold, Messages Today, Incoming Today, and Total Revenue.</p>
+                  <p><strong>Lead Pipeline:</strong> Visual chart showing contacts at each stage — New, Contacted, Interested, Sold, Lost.</p>
+                  <p><strong>Message Trends:</strong> Chart of message volume over the last 7 days to track engagement.</p>
+                  <p><strong>Auto-Refresh:</strong> Data updates automatically — stay on the page and watch numbers change in real time.</p>
                 </div>
               </details>
 
-              <!-- 7. Scheduled Messages -->
+              <!-- 8. Scheduled Messages -->
               <details class="guide-section rounded-2xl border border-gray-200 dark:border-white/5 bg-white dark:bg-dark-800/30 overflow-hidden">
                 <summary class="p-5 cursor-pointer flex items-center gap-3 hover:bg-gray-50 dark:hover:bg-white/[0.02] transition-colors">
-                  <span class="w-8 h-8 rounded-lg bg-accent-blue/15 text-accent-blue flex items-center justify-center flex-shrink-0 text-sm font-bold">7</span>
+                  <span class="w-8 h-8 rounded-lg bg-accent-blue/15 text-accent-blue flex items-center justify-center flex-shrink-0 text-sm font-bold">8</span>
                   <span class="text-sm font-semibold text-gray-800 dark:text-gray-200">Scheduled Messages — Send Later</span>
                 </summary>
                 <div class="px-5 pb-5 text-xs text-gray-600 dark:text-gray-400 space-y-2 border-t border-gray-100 dark:border-white/5 pt-4">
-                  <p><strong>How to Schedule:</strong> Open any chat in the Inbox → Click the 🕐 clock icon → Write your message, pick a date/time → Click "Schedule".</p>
-                  <p><strong>View All:</strong> The Scheduled page lists all pending messages with the recipient, message preview, and scheduled time.</p>
-                  <p><strong>Cancel:</strong> Click "Cancel" on any scheduled message to remove it before it sends.</p>
-                  <p><strong>Auto-Send:</strong> The server checks every 30 seconds for due messages and sends them automatically.</p>
-                  <p><strong>Status:</strong> Shows "pending" until sent, then "sent". Failed messages show "failed".</p>
+                  <p><strong>Schedule:</strong> In any chat, click the 🕐 clock icon → write your message → pick date and time → click Schedule.</p>
+                  <p><strong>View All:</strong> The Scheduled page lists all pending messages with recipient, preview, and scheduled time.</p>
+                  <p><strong>Cancel:</strong> Click Cancel on any scheduled message before it's sent.</p>
+                  <p><strong>Auto-Send:</strong> The server checks every 30 seconds and automatically sends due messages.</p>
+                  <p><strong>Status:</strong> Messages show as <span class="text-amber-400">pending</span> → <span class="text-wa-green">sent</span> → or <span class="text-red-400">failed</span> if delivery issues occur.</p>
                 </div>
               </details>
 
-              <!-- 8. Quick Replies -->
+              <!-- 9. Quick Replies -->
               <details class="guide-section rounded-2xl border border-gray-200 dark:border-white/5 bg-white dark:bg-dark-800/30 overflow-hidden">
                 <summary class="p-5 cursor-pointer flex items-center gap-3 hover:bg-gray-50 dark:hover:bg-white/[0.02] transition-colors">
-                  <span class="w-8 h-8 rounded-lg bg-wa-green/15 text-wa-green flex items-center justify-center flex-shrink-0 text-sm font-bold">8</span>
+                  <span class="w-8 h-8 rounded-lg bg-wa-green/15 text-wa-green flex items-center justify-center flex-shrink-0 text-sm font-bold">9</span>
                   <span class="text-sm font-semibold text-gray-800 dark:text-gray-200">Quick Replies — Canned Responses</span>
                 </summary>
                 <div class="px-5 pb-5 text-xs text-gray-600 dark:text-gray-400 space-y-2 border-t border-gray-100 dark:border-white/5 pt-4">
-                  <p><strong>Create:</strong> Click "New Quick Reply" → Enter a title, shortcut (e.g. <code class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-white/5">/welcome</code>), and the reply message.</p>
-                  <p><strong>Use in Chat:</strong> In the Team Inbox, click the ⚡ bolt icon to reveal your quick reply buttons. Click one to instantly send it.</p>
-                  <p><strong>Edit:</strong> Click any card on this page to edit it.</p>
-                  <p><strong>Delete:</strong> Click "Delete" on the card to remove it.</p>
+                  <p><strong>Create:</strong> Click "New Quick Reply" → set a title, shortcut (e.g. <code class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-white/5">/welcome</code>), and the reply text.</p>
+                  <p><strong>Use in Chat:</strong> In Team Inbox, click ⚡ to show quick reply buttons above the input. Click any to send immediately.</p>
+                  <p><strong>Manage:</strong> Edit or delete quick replies from the Quick Replies page.</p>
+                  <p><strong>Use Case:</strong> Perfect for frequently asked questions, greetings, follow-ups, and standard responses your team sends daily.</p>
                 </div>
               </details>
 
-              <!-- 9. Settings -->
+              <!-- 10. Settings -->
               <details class="guide-section rounded-2xl border border-gray-200 dark:border-white/5 bg-white dark:bg-dark-800/30 overflow-hidden">
                 <summary class="p-5 cursor-pointer flex items-center gap-3 hover:bg-gray-50 dark:hover:bg-white/[0.02] transition-colors">
-                  <span class="w-8 h-8 rounded-lg bg-red-500/15 text-red-500 flex items-center justify-center flex-shrink-0 text-sm font-bold">9</span>
+                  <span class="w-8 h-8 rounded-lg bg-red-500/15 text-red-500 flex items-center justify-center flex-shrink-0 text-sm font-bold">10</span>
                   <span class="text-sm font-semibold text-gray-800 dark:text-gray-200">Settings</span>
                 </summary>
                 <div class="px-5 pb-5 text-xs text-gray-600 dark:text-gray-400 space-y-2 border-t border-gray-100 dark:border-white/5 pt-4">
-                  <p><strong>Connection:</strong> View current WhatsApp connection status — green dot means connected, red means disconnected.</p>
-                  <p><strong>Show QR Code:</strong> Click "Show QR Code" to re-display the QR if you need to re-link your device.</p>
-                  <p><strong>Theme:</strong> Click the moon 🌙 icon in the top bar to toggle between Dark Mode and Light Mode.</p>
-                  <p><strong>About:</strong> Shows the app version and how long the server has been running.</p>
+                  <p><strong>Connection Status:</strong> Shows whether your WhatsApp Cloud API is active — green dot means connected.</p>
+                  <p><strong>Theme:</strong> Click the 🌙 moon icon in the top bar to switch between Dark and Light mode.</p>
+                  <p><strong>Account Info:</strong> View your tenant name and server uptime.</p>
+                  <p><strong>API Config:</strong> Your admin manages the WhatsApp Cloud API credentials — Phone Number ID, Access Token, and Webhook setup.</p>
                 </div>
               </details>
 
-              <!-- Tips -->
+              <!-- Tips & Security -->
               <details class="guide-section rounded-2xl border border-gray-200 dark:border-white/5 bg-white dark:bg-dark-800/30 overflow-hidden">
                 <summary class="p-5 cursor-pointer flex items-center gap-3 hover:bg-gray-50 dark:hover:bg-white/[0.02] transition-colors">
                   <span class="w-8 h-8 rounded-lg bg-amber-500/15 text-amber-500 flex items-center justify-center flex-shrink-0 text-sm font-bold">💡</span>
-                  <span class="text-sm font-semibold text-gray-800 dark:text-gray-200">Tips & Best Practices</span>
+                  <span class="text-sm font-semibold text-gray-800 dark:text-gray-200">Tips, Security & Best Practices</span>
                 </summary>
                 <div class="px-5 pb-5 text-xs text-gray-600 dark:text-gray-400 space-y-2 border-t border-gray-100 dark:border-white/5 pt-4">
-                  <p><strong>Auto-Refresh:</strong> The app polls every 5 seconds for new messages and connection status — no manual refresh needed.</p>
-                  <p><strong>Tags:</strong> Use comma-separated tags on contacts (e.g. "vip, premium, follow-up") for easy organization and filtering.</p>
-                  <p><strong>Phone Detection:</strong> Click "Detect" in the contact info panel to auto-resolve the real phone number from WhatsApp.</p>
-                  <p><strong>Revenue Tracking:</strong> Set revenue on Sold contacts to track total revenue across Analytics and the Contacts page.</p>
-                  <p><strong>Broadcasts + Automation:</strong> Combine them — use Auto-Reply to handle first responses, and Broadcasts for follow-up campaigns.</p>
+                  <p><strong>Real-time Updates:</strong> Messages arrive instantly via server push. The chat list refreshes automatically — no manual reload needed.</p>
+                  <p><strong>Tags:</strong> Use comma-separated tags on contacts (e.g. "vip, premium, follow-up") for easy filtering and organization.</p>
+                  <p><strong>Revenue Tracking:</strong> Set revenue on Sold contacts to track total earnings in Analytics.</p>
+                  <p><strong>Combine Features:</strong> Use Auto-Reply for instant welcome messages + Broadcasts for follow-up campaigns = powerful automation.</p>
+                  <p><strong>Security:</strong> All connections are encrypted. The CRM includes rate limiting, content security headers, and secure session tokens. Your WhatsApp API credentials are never exposed to the browser.</p>
+                  <p><strong>Performance:</strong> Data is cached intelligently — the CRM stays fast even with thousands of contacts and 100+ users.</p>
+                  <p class="text-amber-500"><strong>⚠️ Important:</strong> Never share your login credentials. Always log out when using a shared computer.</p>
                 </div>
               </details>
 
