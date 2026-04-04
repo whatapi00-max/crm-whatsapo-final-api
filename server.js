@@ -665,29 +665,175 @@ class CloudAPIManager {
 
 const waManager = new CloudAPIManager();
 
-// ── Copy-Paste Tracker (in-memory — avoids a DB scan per outgoing message) ──
-// key: `${tenantId}:${message}` -> { phones: Set<string>, ts: number }
-const cpTracker = new Map();
+// ── SpamGuard: Centralized Anti-Spam Engine (15-min rolling window) ──────────
+// Protects WhatsApp numbers from getting banned by detecting & blocking spam patterns.
+//
+// CTWA-aware: contacts who messaged YOU first (Click-to-WhatsApp leads) are
+// warm leads — all 5 rules apply but with HIGHER thresholds so a genuine ad
+// burst doesn't false-fire. Cold outbound contacts get STRICT thresholds.
+//
+// WARM thresholds (CTWA — they messaged you first):
+//   1. Same message content sent to 10+ warm contacts in 15 min
+//   2. Same message content sent 10+ total times to warm contacts in 15 min
+//   3. 50+ unique warm contacts messaged in 15 min
+//   4. 80+ total messages to warm contacts in 15 min
+//   5. 8+ messages to same contact in 15 min (harassment — same for all)
+//
+// COLD thresholds (you initiate, they never messaged first):
+//   1. Same message content sent to 4+ cold contacts in 15 min
+//   2. Same message content sent 4+ total times to cold contacts in 15 min
+//   3. 20+ unique cold contacts messaged in 15 min
+//   4. 40+ total messages to cold contacts in 15 min
+//   5. 8+ messages to same contact in 15 min (harassment — same for all)
 
+const SPAM_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const INBOUND_TTL_MS = 24 * 60 * 60 * 1000; // 24h — WhatsApp conversation window
+
+// Warm (CTWA) thresholds — higher limits, genuine ad leads
+const WARM_SAME_MSG_CONTACTS = 10;
+const WARM_SAME_MSG_TOTAL    = 10;
+const WARM_UNIQUE_CONTACTS   = 50;
+const WARM_TOTAL_MESSAGES    = 80;
+
+// Cold (outbound) thresholds — strict
+const COLD_SAME_MSG_CONTACTS = 4;
+const COLD_SAME_MSG_TOTAL    = 4;
+const COLD_UNIQUE_CONTACTS   = 20;
+const COLD_TOTAL_MESSAGES    = 40;
+
+// Universal — applies to everyone
+const SPAM_SAME_CONTACT = 8; // N messages to same contact in window
+
+// Per-tenant outgoing message log: [{ phone, content, ts, cold }]
+const spamGuard = new Map();
+
+// Inbound contact tracker — phone numbers that have messaged YOU first
+// tenantId -> Map<phone, lastInboundTimestamp>
+const inboundContacts = new Map();
+
+// Called from webhook when an inbound message arrives
+function markInbound(tenantId, phone) {
+  if (!inboundContacts.has(tenantId)) inboundContacts.set(tenantId, new Map());
+  inboundContacts.get(tenantId).set(phone, Date.now());
+}
+
+// Returns true if this phone sent you a message in the last 24 hours
+function isInboundContact(tenantId, phone) {
+  const map = inboundContacts.get(tenantId);
+  if (!map) return false;
+  const ts = map.get(phone);
+  if (!ts) return false;
+  if (Date.now() - ts > INBOUND_TTL_MS) { map.delete(phone); return false; }
+  return true;
+}
+
+function getSpamState(tenantId) {
+  if (!spamGuard.has(tenantId)) spamGuard.set(tenantId, { msgs: [] });
+  return spamGuard.get(tenantId);
+}
+
+function pruneSpamState(state) {
+  const cutoff = Date.now() - SPAM_WINDOW_MS;
+  state.msgs = state.msgs.filter(m => m.ts > cutoff);
+}
+
+function isTenantFrozen(tenantId) {
+  const w = marketerWarnings.get(tenantId);
+  return !!(w && Date.now() < w.expiresAt);
+}
+
+// Check spam rules. Returns { allowed, reason }
+// Call BEFORE actually sending the message to WhatsApp.
+function spamCheck(tenantId, phone, content) {
+  const state = getSpamState(tenantId);
+  pruneSpamState(state);
+
+  // If already frozen, block immediately
+  if (isTenantFrozen(tenantId)) {
+    return { allowed: false, reason: 'Your account is temporarily frozen. Please wait for the cooldown to end.' };
+  }
+
+  const now = Date.now();
+  const normalContent = (content || '').trim().toLowerCase();
+  const warm = isInboundContact(tenantId, phone); // true = CTWA warm lead
+
+  // Pick thresholds based on contact type
+  const SAME_MSG_CONTACTS = warm ? WARM_SAME_MSG_CONTACTS : COLD_SAME_MSG_CONTACTS;
+  const SAME_MSG_TOTAL    = warm ? WARM_SAME_MSG_TOTAL    : COLD_SAME_MSG_TOTAL;
+  const UNIQUE_CONTACTS   = warm ? WARM_UNIQUE_CONTACTS   : COLD_UNIQUE_CONTACTS;
+  const TOTAL_MESSAGES    = warm ? WARM_TOTAL_MESSAGES    : COLD_TOTAL_MESSAGES;
+
+  // Segment messages by same type (warm vs cold) for accurate counting
+  const segMsgs = state.msgs.filter(m => m.cold === !warm);
+
+  // ── Rule 5: harassment — applies to ALL contacts regardless of type ──
+  const sameContactCount = state.msgs.filter(m => m.phone === phone).length + 1;
+  if (sameContactCount >= SPAM_SAME_CONTACT) {
+    return spamFreeze(tenantId, `Sent ${sameContactCount} messages to same contact in 15 min`);
+  }
+
+  // ── Rules 1 & 2: same message content ──
+  const sameMsgs = segMsgs.filter(m => m.content === normalContent);
+  const samePhones = new Set(sameMsgs.map(m => m.phone));
+  samePhones.add(phone);
+  if (samePhones.size >= SAME_MSG_CONTACTS) {
+    return spamFreeze(tenantId, `Same message sent to ${samePhones.size} different contacts in 15 min`);
+  }
+  if (sameMsgs.length + 1 >= SAME_MSG_TOTAL) {
+    return spamFreeze(tenantId, `Same message sent ${sameMsgs.length + 1} times in 15 min`);
+  }
+
+  // ── Rule 3: too many unique contacts of same type ──
+  const uniquePhones = new Set(segMsgs.map(m => m.phone));
+  uniquePhones.add(phone);
+  if (uniquePhones.size >= UNIQUE_CONTACTS) {
+    return spamFreeze(tenantId, `Messaged ${uniquePhones.size} ${warm ? 'contacts' : 'new contacts'} in 15 min`);
+  }
+
+  // ── Rule 4: total volume of same type ──
+  if (segMsgs.length + 1 >= TOTAL_MESSAGES) {
+    return spamFreeze(tenantId, `Sent ${segMsgs.length + 1} messages in 15 min`);
+  }
+
+  // All checks passed — record the message
+  state.msgs.push({ phone, content: normalContent, ts: now, cold: !warm });
+  return { allowed: true, reason: null };
+}
+
+function spamFreeze(tenantId, reason) {
+  const freezeMsg = `⚠️ Anti-spam protection — ${reason}. Screen frozen for 60 seconds.`;
+  marketerWarnings.set(tenantId, { message: freezeMsg, expiresAt: Date.now() + 60000 });
+
+  // Notify admin (throttle: once per 15 min per tenant)
+  setImmediate(async () => {
+    try {
+      const alreadyNotified = adminNotifications.some(n =>
+        n.type === 'copy_paste' && n.tenant_id === tenantId &&
+        (Date.now() - new Date(n.timestamp).getTime()) < 900000
+      );
+      if (!alreadyNotified) {
+        const { data: td } = await supabase.from('tenants').select('name').eq('id', tenantId).maybeSingle();
+        const tname = td?.name || `Marketer #${tenantId}`;
+        pushAdminNotif('copy_paste',
+          `"${tname}" AUTO-FROZEN — ${reason}`,
+          tenantId, tname
+        );
+      }
+    } catch (_) { /* silent */ }
+  });
+
+  console.log(`🛡️ [SpamGuard] Tenant ${tenantId} frozen: ${reason}`);
+  return { allowed: false, reason: freezeMsg, frozen: true };
+}
+
+// Legacy wrapper — still used by admin dashboard stats
 function trackCopyPaste(tenantId, phone, message) {
-  const msg = (message || '').trim();
-  if (msg.length < 5) return 0;
-  const key = `${tenantId}:${msg}`;
-  let entry = cpTracker.get(key);
-  // Reset entry if it's older than 1 hour
-  if (!entry || (Date.now() - entry.ts) > 3600000) {
-    entry = { phones: new Set(), ts: Date.now() };
-    cpTracker.set(key, entry);
-  }
-  entry.phones.add(phone);
-  // Evict stale entries when map grows large
-  if (cpTracker.size > 1000) {
-    const cutoff = Date.now() - 3600000;
-    for (const [k, v] of cpTracker) {
-      if (v.ts < cutoff) cpTracker.delete(k);
-    }
-  }
-  return entry.phones.size;
+  const state = getSpamState(tenantId);
+  pruneSpamState(state);
+  const normalContent = (message || '').trim().toLowerCase();
+  const sameMsgs = state.msgs.filter(m => m.content === normalContent);
+  const uniquePhones = new Set(sameMsgs.map(m => m.phone)).size;
+  return { uniquePhones, totalSends: sameMsgs.length };
 }
 
 // ── Global Scheduled Message Checker ─────────────────────────────────────────
@@ -909,6 +1055,9 @@ async function handleIncomingWebhook(entry) {
           }).eq('tenant_id', resolvedTenantId).eq('phone', phone);
         }
 
+        // Mark this phone as a warm inbound contact (CTWA lead)
+        markInbound(resolvedTenantId, phone);
+
         // Check auto-replies
         if (waManager.isReady(resolvedTenantId)) {
           await waManager.checkAutoReply(resolvedTenantId, phone, body, isNew);
@@ -975,6 +1124,7 @@ app.use(helmet({
       styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com", "https://cdn.tailwindcss.com"],
       fontSrc: ["'self'", "https://fonts.gstatic.com"],
       imgSrc: ["'self'", "blob:", "data:"],
+      mediaSrc: ["'self'", "blob:", "data:"],
       connectSrc: ["'self'", "https://cdn.tailwindcss.com"],
       frameSrc: ["'none'"],
       frameAncestors: ["'self'"],
@@ -1770,14 +1920,21 @@ app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
         if (d >= 0 && d < 7) chart[6 - d]++;
       });
 
-      // Copy-paste detection from in-memory tracker (zero DB cost)
+      // Spam detection from SpamGuard (zero DB cost) — cold sends only
+      const sgState = spamGuard.get(t.id);
       let copyPasteMax = 0;
-      for (const [key, entry] of cpTracker) {
-        if (!key.startsWith(`${t.id}:`)) continue;
-        if ((Date.now() - entry.ts) > 3600000) continue;
-        if (entry.phones.size > copyPasteMax) copyPasteMax = entry.phones.size;
+      if (sgState) {
+        const cutoff = Date.now() - SPAM_WINDOW_MS;
+        const recent = sgState.msgs.filter(m => m.ts > cutoff && m.cold);
+        const contentCounts = new Map();
+        for (const m of recent) {
+          contentCounts.set(m.content, (contentCounts.get(m.content) || 0) + 1);
+        }
+        for (const c of contentCounts.values()) {
+          if (c > copyPasteMax) copyPasteMax = c;
+        }
       }
-      const copyPasteWarn = copyPasteMax >= 3;
+      const copyPasteWarn = copyPasteMax >= COLD_SAME_MSG_TOTAL || isTenantFrozen(t.id);
 
       return {
         id: t.id, name: t.name, username: t.username,
@@ -1927,11 +2084,15 @@ app.post('/api/send-reply', tenantAuth, sendLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Invalid phone number format' });
     }
 
-    // Send immediately for replies (no delay needed for user-initiated messages)
+    // 🛡️ SpamGuard: check BEFORE sending to WhatsApp
+    const spam = spamCheck(req.tenantId, cleanedPhone, message);
+    if (!spam.allowed) {
+      return res.status(429).json({ error: spam.reason, spam_frozen: true });
+    }
+
     await waManager.sendMessage(req.tenantId, cleanedPhone, message);
 
     const now = new Date().toISOString();
-    // Store outgoing message + update lead timestamp in parallel
     await Promise.all([
       supabase.from('conversations').insert({
         tenant_id: req.tenantId, phone: cleanedPhone, message,
@@ -1942,28 +2103,7 @@ app.post('/api/send-reply', tenantAuth, sendLimiter, async (req, res) => {
         .eq('tenant_id', req.tenantId).eq('phone', cleanedPhone)
     ]);
 
-    // Non-blocking copy-paste detection (in-memory — no DB query)
-    setImmediate(async () => {
-      try {
-        const uniqueCount = trackCopyPaste(req.tenantId, cleanedPhone, message);
-        if (uniqueCount >= 3) {
-          const alreadyNotified = adminNotifications.some(n =>
-            n.type === 'copy_paste' && n.tenant_id === req.tenantId &&
-            (Date.now() - new Date(n.timestamp).getTime()) < 900000
-          );
-          if (!alreadyNotified) {
-            const { data: td } = await supabase.from('tenants').select('name').eq('id', req.tenantId).maybeSingle();
-            const tname = td?.name || `Marketer #${req.tenantId}`;
-            pushAdminNotif('copy_paste',
-              `"${tname}" sent identical message to ${uniqueCount} different contacts in the last hour. Message: "${message.substring(0, 50)}${message.length > 50 ? '...' : ''}"`,
-              req.tenantId, tname
-            );
-          }
-        }
-      } catch (_) { /* silent */ }
-    });
-
-    res.json({ success: true, phone: cleanedPhone, timestamp: now });
+    res.json({ success: true, phone: cleanedPhone, timestamp: now, spam_frozen: false });
   } catch (err) {
     res.status(500).json({ error: err.message || 'Failed to send message' });
   }
@@ -1987,6 +2127,12 @@ app.post('/api/send-voice', tenantAuth, sendLimiter, upload.single('audio'), asy
       return res.status(400).json({ error: 'Invalid phone number format' });
     }
 
+    // 🛡️ SpamGuard: check BEFORE sending to WhatsApp
+    const spam = spamCheck(req.tenantId, cleanedPhone, '🎤 Voice message');
+    if (!spam.allowed) {
+      return res.status(429).json({ error: spam.reason, spam_frozen: true });
+    }
+
     // Upload audio to WhatsApp Media API
     const mimeType = req.file.mimetype || 'audio/ogg';
     const mediaId = await waManager.uploadMedia(req.tenantId, req.file.buffer, mimeType);
@@ -2008,7 +2154,7 @@ app.post('/api/send-voice', tenantAuth, sendLimiter, upload.single('audio'), asy
         .eq('tenant_id', req.tenantId).eq('phone', cleanedPhone)
     ]);
 
-    res.json({ success: true, phone: cleanedPhone, timestamp: now, media_url: 'wamid:' + mediaId });
+    res.json({ success: true, phone: cleanedPhone, timestamp: now, media_url: 'wamid:' + mediaId, spam_frozen: false });
   } catch (err) {
     res.status(500).json({ error: err.message || 'Failed to send voice message' });
   }
@@ -2043,6 +2189,13 @@ app.post('/api/send-image', tenantAuth, sendLimiter, upload.single('image'), asy
       return res.status(400).json({ error: 'Image too large. Max 5MB.' });
     }
 
+    // 🛡️ SpamGuard: check BEFORE sending to WhatsApp
+    const imgContent = caption ? `📷 ${caption}` : '📷 Image';
+    const spam = spamCheck(req.tenantId, cleanedPhone, imgContent);
+    if (!spam.allowed) {
+      return res.status(429).json({ error: spam.reason, spam_frozen: true });
+    }
+
     // Upload image to WhatsApp Media API
     const mediaId = await waManager.uploadImageMedia(req.tenantId, req.file.buffer, mimeType);
 
@@ -2064,7 +2217,7 @@ app.post('/api/send-image', tenantAuth, sendLimiter, upload.single('image'), asy
         .eq('tenant_id', req.tenantId).eq('phone', cleanedPhone)
     ]);
 
-    res.json({ success: true, phone: cleanedPhone, timestamp: now, media_url: 'wamid:' + mediaId });
+    res.json({ success: true, phone: cleanedPhone, timestamp: now, media_url: 'wamid:' + mediaId, spam_frozen: false });
   } catch (err) {
     console.error('Send image error:', err.message);
     res.status(500).json({ error: err.message || 'Failed to send image' });
@@ -2081,14 +2234,24 @@ app.get('/api/media-proxy/:conversationId', tenantAuth, async (req, res) => {
     // Check in-memory cache first (populated by cacheIncomingMedia on webhook)
     const cached = getCachedMediaBinary(convId);
     if (cached) {
-      res.set('Content-Type', cached.contentType);
+      let ct = cached.contentType;
+      // WhatsApp CDN sometimes caches with generic content-type for voice messages
+      if (!ct.startsWith('audio/')) {
+        const { data: c } = await supabase.from('conversations')
+          .select('message').eq('id', convId).eq('tenant_id', req.tenantId).maybeSingle();
+        if (c?.message && (c.message.includes('\ud83c\udfa4') || c.message === '[Audio]')) {
+          ct = 'audio/ogg; codecs=opus';
+        }
+      }
+      res.set('Content-Type', ct);
       res.set('Content-Length', cached.buffer.length);
       res.set('Cache-Control', 'private, max-age=3600');
+      if (ct.startsWith('audio/')) res.set('Accept-Ranges', 'bytes');
       return res.send(cached.buffer);
     }
 
     const { data: conv } = await supabase.from('conversations')
-      .select('media_url')
+      .select('media_url, message')
       .eq('id', convId).eq('tenant_id', req.tenantId).maybeSingle();
 
     if (!conv || !conv.media_url) {
@@ -2125,9 +2288,17 @@ app.get('/api/media-proxy/:conversationId', tenantAuth, async (req, res) => {
       return res.status(502).json({ error: 'Failed to download media' });
     }
 
-    const contentType = mediaRes.headers.get('content-type') || 'application/octet-stream';
+    let contentType = mediaRes.headers.get('content-type') || 'application/octet-stream';
     const arrayBuf = await mediaRes.arrayBuffer();
     const mediaBuf = Buffer.from(arrayBuf);
+
+    // WhatsApp CDN sometimes returns application/octet-stream for voice messages.
+    // Force correct audio MIME so browsers can decode the blob.
+    const isVoiceMsg = conv.message && (conv.message.includes('🎤') || conv.message === '[Audio]');
+    if (isVoiceMsg && !contentType.startsWith('audio/')) {
+      contentType = 'audio/ogg; codecs=opus';
+    }
+
     res.set('Content-Type', contentType);
     res.set('Content-Length', mediaBuf.length);
     res.set('Cache-Control', 'private, max-age=3600');
@@ -2612,6 +2783,26 @@ async function sendBroadcastAsync(tenantId, broadcastId, message) {
         }
 
         const cleanedPhone = recipient.phone.replace(/\D/g, '');
+
+        // 🛡️ SpamGuard: record each broadcast send in the spam tracker
+        const spam = spamCheck(tenantId, cleanedPhone, message);
+        if (!spam.allowed) {
+          // Spam limit hit mid-broadcast — pause remaining recipients
+          const remainingIds = recipients.slice(i).map(r => r.id);
+          if (remainingIds.length > 0) {
+            await supabase.from('broadcast_recipients')
+              .update({ status: 'failed', error_message: 'SpamGuard: sending paused — anti-spam limit reached' })
+              .in('id', remainingIds);
+            failedCount += remainingIds.length;
+          }
+          await supabase.from('broadcasts').update({
+            status: 'cancelled', sent_count: sentCount, failed_count: failedCount,
+            completed_at: new Date().toISOString()
+          }).eq('id', broadcastId);
+          console.log(`🛡️ [SpamGuard] Broadcast ${broadcastId} paused at ${sentCount} sends — anti-spam limit`);
+          return;
+        }
+
         await delay(MESSAGE_DELAY_MS + Math.random() * 2000);
         await waManager.sendMessage(tenantId, cleanedPhone, message);
 

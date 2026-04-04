@@ -938,7 +938,7 @@ async function sendMessage() {
   container.scrollTop = container.scrollHeight;
 
   try {
-    await apiPost('/api/send-reply', { phone: currentPhone, message });
+    const sendResult = await apiPost('/api/send-reply', { phone: currentPhone, message });
     // Update the pending indicator to sent
     const timeEl = tempBubble.querySelector('.msg-time');
     if (timeEl) timeEl.textContent = timeEl.textContent.replace('⏳', '✓✓');
@@ -957,7 +957,12 @@ async function sendMessage() {
     tempBubble.querySelector('.msg-bubble').style.borderColor = 'rgba(239,68,68,0.4)';
     const timeEl = tempBubble.querySelector('.msg-time');
     if (timeEl) timeEl.textContent = timeEl.textContent.replace('⏳', '❌');
-    showToast(err.message || 'Failed to send', 'error');
+    // Check if this is a SpamGuard freeze
+    const errMsg = err.message || 'Failed to send';
+    if (errMsg.includes('Anti-spam') || errMsg.includes('frozen')) {
+      triggerAdminFreeze(errMsg, 60);
+    }
+    showToast(errMsg, 'error');
   } finally {
     isSending = false;
     sendBtn.disabled = false;
@@ -998,7 +1003,10 @@ async function toggleVoicePlay(btn) {
         const errMsg = errData.error || `HTTP ${res.status}`;
         throw new Error(res.status === 404 ? 'Audio not available for this message' : errMsg);
       }
-      const blob = await res.blob();
+      const arrayBuf = await res.arrayBuffer();
+      const ct = res.headers.get('content-type') || '';
+      const audioMime = ct.startsWith('audio/') ? ct : 'audio/ogg; codecs=opus';
+      const blob = new Blob([arrayBuf], { type: audioMime });
       const blobUrl = URL.createObjectURL(blob);
       audio.src = blobUrl;
       // Wait for audio to be ready
@@ -1491,7 +1499,11 @@ async function sendVoiceRecording() {
     tempBubble.querySelector('.msg-bubble').style.borderColor = 'rgba(239,68,68,0.4)';
     const timeEl = tempBubble.querySelector('.msg-time');
     if (timeEl) timeEl.textContent = timeEl.textContent.replace('⏳', '❌');
-    showToast(err.message || 'Failed to send voice message', 'error');
+    const errMsg = err.message || 'Failed to send voice message';
+    if (errMsg.includes('Anti-spam') || errMsg.includes('frozen')) {
+      triggerAdminFreeze(errMsg, 60);
+    }
+    showToast(errMsg, 'error');
   } finally {
     isSending = false;
     if (sendBtn) sendBtn.disabled = false;
@@ -1601,7 +1613,11 @@ async function sendImage() {
     tempBubble.querySelector('.msg-bubble').style.borderColor = 'rgba(239,68,68,0.4)';
     const timeEl = tempBubble.querySelector('.msg-time');
     if (timeEl) timeEl.textContent = timeEl.textContent.replace('⏳', '❌');
-    showToast(err.message || 'Failed to send image', 'error');
+    const errMsg = err.message || 'Failed to send image';
+    if (errMsg.includes('Anti-spam') || errMsg.includes('frozen')) {
+      triggerAdminFreeze(errMsg, 60);
+    }
+    showToast(errMsg, 'error');
   } finally {
     isSending = false;
     if (sendBtn) { sendBtn.disabled = false; sendBtn.innerHTML = '<svg class="w-4 h-4 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg> Send'; }
