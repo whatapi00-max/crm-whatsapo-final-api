@@ -14,6 +14,11 @@ ALTER TABLE conversations ADD COLUMN IF NOT EXISTS media_url TEXT;
 -- Add index for webhook routing (find tenant by phone_number_id)
 CREATE INDEX IF NOT EXISTS idx_tenants_wa_phone_number_id ON tenants(wa_phone_number_id);
 
+-- Add ban persistence columns (auto-migrated by server on startup)
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS wa_banned BOOLEAN DEFAULT false;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS wa_banned_reason TEXT;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS wa_banned_at TIMESTAMPTZ;
+
 -- Create exec_sql helper function (needed for server auto-migrations)
 CREATE OR REPLACE FUNCTION exec_sql(sql TEXT)
 RETURNS void

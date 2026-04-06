@@ -199,7 +199,7 @@ class CloudAPIManager {
 
   isReady(tenantId) {
     const cfg = this.getConfig(tenantId);
-    return !!(cfg && cfg.phone_number_id && cfg.access_token);
+    return !!(cfg && cfg.phone_number_id && cfg.access_token && !cfg.banned);
   }
 
   getStatus(tenantId) {
@@ -217,6 +217,15 @@ class CloudAPIManager {
       cfg.banned_reason = reason || 'Unknown';
       cfg.banned_at = new Date().toISOString();
       console.error(`🚫 [Tenant ${tenantId}] WhatsApp number BANNED: ${reason}`);
+      // Persist to DB (fire-and-forget)
+      supabase.from('tenants').update({
+        wa_banned: true,
+        wa_banned_reason: (reason || 'Unknown').substring(0, 500),
+        wa_banned_at: cfg.banned_at,
+        updated_at: cfg.banned_at
+      }).eq('id', tenantId).then(() => {}).catch(() => {});
+      // Push real-time ban notification to any open CRM tabs for this tenant
+      try { broadcastToTenant(tenantId, 'wa_banned', { reason: cfg.banned_reason, banned_at: cfg.banned_at }); } catch (_) {}
     }
   }
 
@@ -226,24 +235,49 @@ class CloudAPIManager {
       delete cfg.banned;
       delete cfg.banned_reason;
       delete cfg.banned_at;
+      // Persist to DB (fire-and-forget)
+      supabase.from('tenants').update({
+        wa_banned: false,
+        wa_banned_reason: null,
+        wa_banned_at: null,
+        updated_at: new Date().toISOString()
+      }).eq('id', tenantId).then(() => {}).catch(() => {});
     }
   }
 
   async loadFromDB(tenantId) {
     const tid = String(tenantId);
-    const { data: tenant, error } = await supabase.from('tenants')
-      .select('wa_phone_number_id, wa_access_token, wa_waba_id')
-      .eq('id', tenantId).maybeSingle();
+    // Try loading with ban columns; fall back if columns don't exist yet (pre-migration)
+    let tenant, error;
+    ({ data: tenant, error } = await supabase.from('tenants')
+      .select('wa_phone_number_id, wa_access_token, wa_waba_id, wa_banned, wa_banned_reason, wa_banned_at')
+      .eq('id', tenantId).maybeSingle());
+    if (error && (error.code === '42703' || (error.message && error.message.includes('does not exist')))) {
+      // Ban columns not yet migrated — load without them
+      ({ data: tenant, error } = await supabase.from('tenants')
+        .select('wa_phone_number_id, wa_access_token, wa_waba_id')
+        .eq('id', tenantId).maybeSingle());
+    }
 
     if (error) throw error;
 
     if (tenant && tenant.wa_phone_number_id && tenant.wa_access_token) {
-      this.configs.set(tid, {
+      const cfg = {
         phone_number_id: tenant.wa_phone_number_id,
         access_token: tenant.wa_access_token,
         waba_id: tenant.wa_waba_id || null
-      });
-      console.log(`✅ [Tenant ${tid}] Cloud API config loaded (Phone ID: ${tenant.wa_phone_number_id})`);
+      };
+      // Restore ban state from DB
+      if (tenant.wa_banned) {
+        cfg.banned = true;
+        cfg.banned_reason = tenant.wa_banned_reason || 'Unknown';
+        cfg.banned_at = tenant.wa_banned_at || null;
+        console.warn(`🚫 [Tenant ${tid}] Loaded as BANNED: ${cfg.banned_reason}`);
+      }
+      this.configs.set(tid, cfg);
+      if (!tenant.wa_banned) {
+        console.log(`✅ [Tenant ${tid}] Cloud API config loaded (Phone ID: ${tenant.wa_phone_number_id})`);
+      }
       return true;
     }
     return false;
@@ -280,6 +314,9 @@ class CloudAPIManager {
         wa_phone_number_id: phoneNumberId || null,
         wa_access_token: accessToken || null,
         wa_waba_id: wabaId || null,
+        wa_banned: false,
+        wa_banned_reason: null,
+        wa_banned_at: null,
         updated_at: new Date().toISOString()
       })
       .eq('id', tenantId);
@@ -339,7 +376,7 @@ class CloudAPIManager {
       const errCode = data.error?.code;
       const errMsg = data.error?.message || data.error?.error_data?.details || JSON.stringify(data.error) || 'Cloud API error';
       // Check for ban-related errors
-      if (errCode === 131031 || errCode === 368 || errCode === 131026) {
+      if (errCode === 131031 || errCode === 368 || errCode === 131026 || errCode === 131056) {
         this.markBanned(tenantId, `Error ${errCode}: ${errMsg}`);
       }
       throw new Error(errMsg);
@@ -524,7 +561,7 @@ class CloudAPIManager {
     if (!response.ok) {
       const errCode = data.error?.code;
       const errMsg = data.error?.message || data.error?.error_data?.details || JSON.stringify(data.error) || 'Cloud API error';
-      if (errCode === 131031 || errCode === 368 || errCode === 131026) {
+      if (errCode === 131031 || errCode === 368 || errCode === 131026 || errCode === 131056) {
         this.markBanned(tenantId, `Error ${errCode}: ${errMsg}`);
       }
       throw new Error(errMsg);
@@ -601,7 +638,7 @@ class CloudAPIManager {
     if (!response.ok) {
       const errCode = data.error?.code;
       const errMsg = data.error?.message || data.error?.error_data?.details || JSON.stringify(data.error) || 'Cloud API error';
-      if (errCode === 131031 || errCode === 368 || errCode === 131026) {
+      if (errCode === 131031 || errCode === 368 || errCode === 131026 || errCode === 131056) {
         this.markBanned(tenantId, `Error ${errCode}: ${errMsg}`);
       }
       throw new Error(errMsg);
@@ -648,7 +685,7 @@ class CloudAPIManager {
                 direction: 'outgoing', status: 'sent'
               });
               console.log(`🤖 [Tenant ${tenantId}] Auto-reply sent to ${phone}`);
-            } catch (e) { console.error('⚠️  Auto-reply send error:', e.message); }
+            } catch (e) { console.error('⚠️  Auto-reply send error:', e.message); pushAdminNotif('error', `Auto-reply failed [${phone}]: ${e.message}`, tenantId, null); }
           }, 1500);
           return;
         }
@@ -848,7 +885,7 @@ const globalSchedulerInterval = setInterval(async () => {
       .lte('scheduled_at', new Date().toISOString())
       .order('scheduled_at', { ascending: true }).limit(20);
 
-    if (pendErr) { console.error('⚠️  Scheduler DB error:', pendErr.message); return; }
+    if (pendErr) { console.error('⚠️  Scheduler DB error:', pendErr.message); pushAdminNotif('error', `Scheduler DB error: ${pendErr.message}`, null, 'System'); return; }
     if (!pending || pending.length === 0) return;
 
     for (const sm of pending) {
@@ -871,6 +908,7 @@ const globalSchedulerInterval = setInterval(async () => {
     }
   } catch (err) {
     console.error('⚠️  Global scheduler error:', err.message);
+    pushAdminNotif('error', `Scheduler error: ${err.message}`, null, 'System');
   } finally {
     schedulerRunning = false;
   }
@@ -1064,6 +1102,7 @@ async function handleIncomingWebhook(entry) {
         }
       } catch (err) {
         console.error(`❌ Webhook message processing error:`, err.message);
+        pushAdminNotif('error', `Webhook message error: ${err.message}`, resolvedTenantId, null);
       }
     }
 
@@ -1074,7 +1113,39 @@ async function handleIncomingWebhook(entry) {
         if (status.status === 'failed') {
           const errCode = status.errors?.[0]?.code;
           const errMsg = status.errors?.[0]?.message || 'Unknown error';
-          console.warn(`⚠️  Message ${status.id} failed: ${errMsg} (code: ${errCode})`);
+          const recipientPhone = status.recipient_id ? cleanPhone(status.recipient_id) : null;
+          console.warn(`⚠️  [Tenant ${resolvedTenantId}] Message ${status.id} FAILED to ${recipientPhone || '?'}: ${errMsg} (code: ${errCode})`);
+
+          // Update the conversation record to 'failed' so CRM shows the real status
+          if (recipientPhone) {
+            // SELECT the most recent sent message first, then update ONLY that row by ID
+            // (Supabase .limit() on UPDATE may not limit rows — could mark all sent msgs as failed)
+            const { data: toUpdate } = await supabase.from('conversations')
+              .select('id')
+              .eq('tenant_id', resolvedTenantId)
+              .eq('phone', recipientPhone)
+              .eq('direction', 'outgoing')
+              .eq('status', 'sent')
+              .order('created_at', { ascending: false })
+              .limit(1)
+              .maybeSingle();
+            if (toUpdate) {
+              const { error: updErr } = await supabase.from('conversations')
+                .update({ status: 'failed' })
+                .eq('id', toUpdate.id);
+              if (updErr) console.error(`❌ Failed to update conversation status:`, updErr.message);
+            }
+          }
+
+          // Push SSE event so the open CRM tab shows the failure immediately
+          broadcastToTenant(resolvedTenantId, 'message_failed', {
+            phone: recipientPhone,
+            error: errMsg,
+            error_code: errCode,
+            wa_message_id: status.id
+          });
+
+          pushAdminNotif('error', `Message to ${recipientPhone || '?'} failed: ${errMsg} (code: ${errCode})`, resolvedTenantId);
 
           // Detect ban-related error codes
           // 131031 = Business account restricted/banned
@@ -1088,14 +1159,16 @@ async function handleIncomingWebhook(entry) {
             try {
               await supabase.from('activity_log').insert({
                 tenant_id: resolvedTenantId,
-                phone: status.recipient_id || 'system',
+                phone: recipientPhone || 'system',
                 action: 'wa_banned',
                 details: `WhatsApp number banned/restricted. Error ${errCode}: ${errMsg}`
               });
             } catch (_) {}
           }
         }
-      } catch (_) {}
+      } catch (statusErr) {
+        console.error(`❌ Webhook status processing error:`, statusErr.message);
+      }
     }
   }
 }
@@ -1354,6 +1427,7 @@ app.post('/webhook', async (req, res) => {
     }
   } catch (err) {
     console.error('❌ Webhook processing error:', err.message);
+    pushAdminNotif('error', `Webhook processing error: ${err.message}`, null, 'System');
   }
 });
 
@@ -1390,6 +1464,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
     });
   } catch (err) {
     console.error('Login error:', err.message);
+    pushAdminNotif('error', `Tenant login failed: ${err.message}`, null, 'Auth');
     res.status(500).json({ error: 'Login failed' });
   }
 });
@@ -1477,20 +1552,26 @@ app.get('/api/admin/tenants', adminAuth, async (req, res) => {
     if (cached) return res.json(cached);
 
     const { data, error } = await supabase.from('tenants')
-      .select('id, username, unique_key, name, is_active, created_at, updated_at, wa_phone_number_id')
+      .select('id, username, unique_key, name, is_active, created_at, updated_at, wa_phone_number_id, wa_banned')
       .order('created_at', { ascending: false });
     if (error) throw error;
 
-    const tenants = (data || []).map(t => ({
-      ...t,
-      wa_status: waManager.getStatus(t.id),
-      wa_configured: !!(t.wa_phone_number_id)
-    }));
+    const tenants = (data || []).map(t => {
+      let wa_status = waManager.getStatus(t.id);
+      // Fallback: if in-memory says not_configured but DB has config, use DB state
+      if (wa_status === 'not_configured' && t.wa_phone_number_id) {
+        wa_status = t.wa_banned ? 'banned' : 'connected';
+        // Also try to lazy-load into memory for future requests
+        waManager.loadFromDB(t.id).catch(() => {});
+      }
+      return { ...t, wa_status, wa_configured: !!(t.wa_phone_number_id) };
+    });
 
     setCachedResponse(cacheKey, tenants, 60000);
     res.json(tenants);
   } catch (err) {
     console.error('Failed to fetch tenants:', err.message);
+    pushAdminNotif('error', `Load marketers failed: ${err.message}`, null, 'Admin');
     res.status(500).json({ error: 'Failed to fetch tenants' });
   }
 });
@@ -1526,6 +1607,7 @@ app.post('/api/admin/tenants', adminAuth, async (req, res) => {
     res.json({ ...data, password_plain: String(password), wa_status: 'not_configured' });
   } catch (err) {
     console.error('Create tenant error:', err.message);
+    pushAdminNotif('error', `Create marketer failed: ${err.message}`, null, 'Admin');
     res.status(500).json({ error: 'Failed to create tenant' });
   }
 });
@@ -1569,6 +1651,7 @@ app.delete('/api/admin/tenants/:id', adminAuth, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('Delete tenant error:', err.message);
+    pushAdminNotif('error', `Delete marketer #${req.params.id} failed: ${err.message}`, null, 'Admin');
     res.status(500).json({ error: 'Failed to delete tenant' });
   }
 });
@@ -1633,6 +1716,7 @@ app.post('/api/admin/tenants/:id/configure-wa', adminAuth, async (req, res) => {
     });
   } catch (err) {
     console.error(`❌ Configure WA error for tenant ${req.params.id}:`, err.message);
+    pushAdminNotif('error', `WhatsApp config failed for marketer #${req.params.id}: ${err.message}`, parseInt(req.params.id), null);
     res.status(500).json({ error: err.message || 'Failed to configure WhatsApp' });
   }
 });
@@ -1817,6 +1901,7 @@ app.get('/api/admin/storage', adminAuth, async (req, res) => {
     res.json(storageResult);
   } catch (err) {
     console.error('Storage stats error:', err.message);
+    pushAdminNotif('error', `Storage stats failed: ${err.message}`, null, 'Admin');
     res.status(500).json({ error: 'Failed to fetch storage stats' });
   }
 });
@@ -1828,7 +1913,7 @@ app.get('/api/admin/storage/tenants', adminAuth, async (req, res) => {
     const cached = getCachedResponse(cacheKey);
     if (cached) return res.json(cached);
 
-    const { data: allTenants } = await supabase.from('tenants').select('id, name, username');
+    const { data: allTenants } = await supabase.from('tenants').select('id, name, username, wa_phone_number_id, wa_banned');
     if (!allTenants) return res.json([]);
 
     const breakdown = await Promise.all(allTenants.map(async (t) => {
@@ -1842,7 +1927,11 @@ app.get('/api/admin/storage/tenants', adminAuth, async (req, res) => {
       const leadsCount = leadsRes.count || 0;
       const broadcastsCount = broadcastsRes.count || 0;
       const totalRows = convCount + leadsCount + broadcastsCount;
-      const waStatus = waManager.getStatus(t.id);
+      let waStatus = waManager.getStatus(t.id);
+      if (waStatus === 'not_configured' && t.wa_phone_number_id) {
+        waStatus = t.wa_banned ? 'banned' : 'connected';
+        waManager.loadFromDB(t.id).catch(() => {});
+      }
 
       return {
         id: t.id, name: t.name, username: t.username,
@@ -1859,6 +1948,7 @@ app.get('/api/admin/storage/tenants', adminAuth, async (req, res) => {
     res.json(breakdown);
   } catch (err) {
     console.error('Tenant storage breakdown error:', err.message);
+    pushAdminNotif('error', `Tenant storage breakdown failed: ${err.message}`, null, 'Admin');
     res.status(500).json({ error: 'Failed to fetch tenant storage breakdown' });
   }
 });
@@ -1875,6 +1965,7 @@ app.post('/api/admin/storage/cleanup', adminAuth, async (req, res) => {
     res.json({ deleted: count || 0, days });
   } catch (err) {
     console.error('Cleanup error:', err.message);
+    pushAdminNotif('error', `Storage cleanup failed: ${err.message}`, null, 'Admin');
     res.status(500).json({ error: 'Failed to cleanup' });
   }
 });
@@ -1892,7 +1983,7 @@ app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
     if (cached) return res.json(cached);
 
     const { data: allTenants, error } = await supabase.from('tenants')
-      .select('id, name, username, is_active')
+      .select('id, name, username, is_active, wa_phone_number_id, wa_banned')
       .order('name', { ascending: true });
     if (error) throw error;
 
@@ -1936,9 +2027,15 @@ app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
       }
       const copyPasteWarn = copyPasteMax >= COLD_SAME_MSG_TOTAL || isTenantFrozen(t.id);
 
+      let wa_status = waManager.getStatus(t.id);
+      if (wa_status === 'not_configured' && t.wa_phone_number_id) {
+        wa_status = t.wa_banned ? 'banned' : 'connected';
+        waManager.loadFromDB(t.id).catch(() => {});
+      }
+
       return {
         id: t.id, name: t.name, username: t.username,
-        is_active: t.is_active, wa_status: waManager.getStatus(t.id),
+        is_active: t.is_active, wa_status,
         stats: {
           total_leads: leadsRes.count || 0,
           messages_today: msgsToday.count || 0,
@@ -1951,9 +2048,13 @@ app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
       };
       } catch (tErr) {
         console.error(`⚠️  Dashboard stats failed for tenant ${t.id}:`, tErr.message);
+        let wa_status_err = waManager.getStatus(t.id);
+        if (wa_status_err === 'not_configured' && t.wa_phone_number_id) {
+          wa_status_err = t.wa_banned ? 'banned' : 'connected';
+        }
         return {
           id: t.id, name: t.name, username: t.username,
-          is_active: t.is_active, wa_status: waManager.getStatus(t.id),
+          is_active: t.is_active, wa_status: wa_status_err,
           stats: { total_leads: 0, messages_today: 0, messages_week: 0, incoming_today: 0, weekly_chart: new Array(7).fill(0) },
           copy_paste_warning: false, copy_paste_max: 0, error: true,
         };
@@ -2026,6 +2127,31 @@ app.get('/api/warn-check', tenantAuth, (req, res) => {
   res.json({ warned: false });
 });
 
+// ── Client-side Error Reporting (from marketer CRM) ──
+const _reportedErrors = new Map(); // throttle: key -> timestamp
+app.post('/api/report-error', tenantAuth, (req, res) => {
+  const { error: errMsg, context, api_path } = req.body || {};
+  if (!errMsg) return res.status(400).json({ error: 'Missing error' });
+  // Throttle: same error from same tenant max once per 5 minutes
+  const key = `${req.tenantId}_${errMsg.substring(0, 80)}`;
+  const now = Date.now();
+  if (_reportedErrors.get(key) && (now - _reportedErrors.get(key)) < 300000) {
+    return res.json({ success: true, throttled: true });
+  }
+  _reportedErrors.set(key, now);
+  // Clean old entries every 100 reports
+  if (_reportedErrors.size > 500) {
+    for (const [k, v] of _reportedErrors) { if (now - v > 600000) _reportedErrors.delete(k); }
+  }
+  const details = [
+    errMsg.substring(0, 200),
+    api_path ? `API: ${api_path}` : '',
+    context ? `Context: ${context}` : ''
+  ].filter(Boolean).join(' | ');
+  pushAdminNotif('error', details, req.tenantId, req.tenantName);
+  res.json({ success: true });
+});
+
 // ══════════════════════════════════════════════
 // TENANT API ROUTES (all scoped by tenant_id)
 // ══════════════════════════════════════════════
@@ -2075,6 +2201,10 @@ app.post('/api/send-reply', tenantAuth, sendLimiter, async (req, res) => {
     const { phone, message } = req.body;
     if (!phone || !message) return res.status(400).json({ error: 'Phone and message are required' });
 
+    if (waManager.getStatus(req.tenantId) === 'banned') {
+      const cfg = waManager.getConfig(req.tenantId);
+      return res.status(403).json({ error: '\ud83d\udeab WhatsApp number is banned/restricted. ' + (cfg?.banned_reason || 'Contact admin.'), banned: true });
+    }
     if (!waManager.isReady(req.tenantId)) {
       return res.status(503).json({ error: 'WhatsApp Cloud API not configured. Contact admin.' });
     }
@@ -2105,6 +2235,7 @@ app.post('/api/send-reply', tenantAuth, sendLimiter, async (req, res) => {
 
     res.json({ success: true, phone: cleanedPhone, timestamp: now, spam_frozen: false });
   } catch (err) {
+    pushAdminNotif('error', `Send message failed [${req.body.phone || '?'}]: ${err.message}`, req.tenantId, req.tenantName);
     res.status(500).json({ error: err.message || 'Failed to send message' });
   }
 });
@@ -2118,6 +2249,10 @@ app.post('/api/send-voice', tenantAuth, sendLimiter, upload.single('audio'), asy
     if (!phone) return res.status(400).json({ error: 'Phone is required' });
     if (!req.file) return res.status(400).json({ error: 'Audio file is required' });
 
+    if (waManager.getStatus(req.tenantId) === 'banned') {
+      const cfg = waManager.getConfig(req.tenantId);
+      return res.status(403).json({ error: '\ud83d\udeab WhatsApp number is banned/restricted. ' + (cfg?.banned_reason || 'Contact admin.'), banned: true });
+    }
     if (!waManager.isReady(req.tenantId)) {
       return res.status(503).json({ error: 'WhatsApp Cloud API not configured. Contact admin.' });
     }
@@ -2156,6 +2291,7 @@ app.post('/api/send-voice', tenantAuth, sendLimiter, upload.single('audio'), asy
 
     res.json({ success: true, phone: cleanedPhone, timestamp: now, media_url: 'wamid:' + mediaId, spam_frozen: false });
   } catch (err) {
+    pushAdminNotif('error', `Send voice failed [${req.body?.phone || '?'}]: ${err.message}`, req.tenantId, req.tenantName);
     res.status(500).json({ error: err.message || 'Failed to send voice message' });
   }
 });
@@ -2168,6 +2304,10 @@ app.post('/api/send-image', tenantAuth, sendLimiter, upload.single('image'), asy
     if (!phone) return res.status(400).json({ error: 'Phone is required' });
     if (!req.file) return res.status(400).json({ error: 'Image file is required' });
 
+    if (waManager.getStatus(req.tenantId) === 'banned') {
+      const cfg = waManager.getConfig(req.tenantId);
+      return res.status(403).json({ error: '\ud83d\udeab WhatsApp number is banned/restricted. ' + (cfg?.banned_reason || 'Contact admin.'), banned: true });
+    }
     if (!waManager.isReady(req.tenantId)) {
       return res.status(503).json({ error: 'WhatsApp Cloud API not configured. Contact admin.' });
     }
@@ -2220,6 +2360,7 @@ app.post('/api/send-image', tenantAuth, sendLimiter, upload.single('image'), asy
     res.json({ success: true, phone: cleanedPhone, timestamp: now, media_url: 'wamid:' + mediaId, spam_frozen: false });
   } catch (err) {
     console.error('Send image error:', err.message);
+    pushAdminNotif('error', `Send image failed [${req.body?.phone || '?'}]: ${err.message}`, req.tenantId, req.tenantName);
     res.status(500).json({ error: err.message || 'Failed to send image' });
   }
 });
@@ -2308,6 +2449,7 @@ app.get('/api/media-proxy/:conversationId', tenantAuth, async (req, res) => {
     res.send(mediaBuf);
   } catch (err) {
     console.error('Media proxy error:', err.message);
+    pushAdminNotif('error', `Media proxy error [conv #${req.params.conversationId}]: ${err.message}`, req.tenantId, req.tenantName);
     res.status(500).json({ error: 'Failed to proxy media' });
   }
 });
@@ -2406,6 +2548,7 @@ app.put('/api/leads/:phone', tenantAuth, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('❌ Lead update error:', err.message || err);
+    pushAdminNotif('error', `Lead update failed [${req.params.phone}]: ${err.message || err}`, req.tenantId, req.tenantName);
     res.status(500).json({ error: 'Failed to update lead' });
   }
 });
@@ -2704,6 +2847,10 @@ app.post('/api/broadcasts', tenantAuth, async (req, res) => {
 
 app.post('/api/broadcasts/:id/send', tenantAuth, async (req, res) => {
   try {
+    if (waManager.getStatus(req.tenantId) === 'banned') {
+      const cfg = waManager.getConfig(req.tenantId);
+      return res.status(403).json({ error: '\ud83d\udeab WhatsApp number is banned/restricted. ' + (cfg?.banned_reason || 'Contact admin.'), banned: true });
+    }
     if (!waManager.isReady(req.tenantId)) {
       return res.status(503).json({ error: 'WhatsApp Cloud API not configured' });
     }
@@ -2776,6 +2923,23 @@ async function sendBroadcastAsync(tenantId, broadcastId, message) {
       }
 
       try {
+        // Check if tenant got banned mid-broadcast — abort remaining
+        if (waManager.getStatus(tenantId) === 'banned') {
+          const remainingIds = recipients.slice(i).map(r => r.id);
+          if (remainingIds.length > 0) {
+            await supabase.from('broadcast_recipients')
+              .update({ status: 'failed', error_message: 'WhatsApp number banned/restricted' })
+              .in('id', remainingIds);
+            failedCount += remainingIds.length;
+          }
+          await supabase.from('broadcasts').update({
+            status: 'cancelled', sent_count: sentCount, failed_count: failedCount,
+            completed_at: new Date().toISOString()
+          }).eq('id', broadcastId);
+          console.log(`\ud83d\udeab Broadcast ${broadcastId} aborted — tenant ${tenantId} banned. Sent: ${sentCount}, Failed: ${failedCount}`);
+          pushAdminNotif('error', `Broadcast ${broadcastId} aborted: WhatsApp number banned`, tenantId);
+          return;
+        }
         if (!waManager.isReady(tenantId)) {
           await supabase.from('broadcast_recipients')
             .update({ status: 'failed', error_message: 'WhatsApp not configured' }).eq('id', recipient.id);
@@ -2828,6 +2992,7 @@ async function sendBroadcastAsync(tenantId, broadcastId, message) {
     }).eq('id', broadcastId);
   } catch (err) {
     console.error('❌ Broadcast error:', err.message);
+    pushAdminNotif('error', `Broadcast #${broadcastId} failed: ${err.message}`, tenantId, null);
     await supabase.from('broadcasts').update({ status: 'cancelled' }).eq('id', broadcastId);
   }
 }
@@ -3128,6 +3293,7 @@ app.get('/api/active-chats', tenantAuth, async (req, res) => {
     res.json(chats);
   } catch (err) {
     console.error('Active chats error:', err.message);
+    pushAdminNotif('error', `Active chats load failed: ${err.message}`, req.tenantId, req.tenantName);
     res.status(500).json({ error: 'Failed to fetch active chats' });
   }
 });
@@ -3270,6 +3436,35 @@ async function runStartupMigrations() {
   } catch (err) {
     if (!isAbortError(err)) console.warn('⚠️  Could not verify Realtime publication:', err.message);
   }
+
+  // ── 3. Ensure wa_banned columns exist on tenants ──
+  try {
+    const { error } = await supabase.from('tenants').select('wa_banned').limit(0);
+    if (error) {
+      const isMissing = error.code === '42703' ||
+        (error.message && error.message.toLowerCase().includes('wa_banned'));
+      if (isMissing) {
+        console.warn('⚠️  tenants.wa_banned columns missing — auto-migrating...');
+        const { error: rpcErr } = await supabase.rpc('exec_sql', {
+          sql: `
+            ALTER TABLE tenants ADD COLUMN IF NOT EXISTS wa_banned BOOLEAN DEFAULT false;
+            ALTER TABLE tenants ADD COLUMN IF NOT EXISTS wa_banned_reason TEXT;
+            ALTER TABLE tenants ADD COLUMN IF NOT EXISTS wa_banned_at TIMESTAMPTZ;
+          `
+        });
+        if (!rpcErr) {
+          console.log('✅ Migration: wa_banned columns added to tenants.');
+        } else {
+          console.error('❌ Auto-migration failed for wa_banned. Run in Supabase SQL Editor:');
+          console.error('   ALTER TABLE tenants ADD COLUMN IF NOT EXISTS wa_banned BOOLEAN DEFAULT false;');
+          console.error('   ALTER TABLE tenants ADD COLUMN IF NOT EXISTS wa_banned_reason TEXT;');
+          console.error('   ALTER TABLE tenants ADD COLUMN IF NOT EXISTS wa_banned_at TIMESTAMPTZ;');
+        }
+      }
+    }
+  } catch (err) {
+    if (!isAbortError(err)) console.warn('⚠️  Could not verify DB schema (wa_banned):', err.message);
+  }
 }
 
 // ══════════════════════════════════════════════
@@ -3287,8 +3482,12 @@ const server = app.listen(PORT, () => {
   console.log('╚══════════════════════════════════════════════════╝');
   console.log('');
 
-  runStartupMigrations().catch(() => {});
-  initAllTenants();
+  runStartupMigrations().catch(() => {}).then(() => {
+    initAllTenants();
+    // Start Supabase Realtime subscription at boot so incoming messages
+    // are tracked even before any CRM tab connects via SSE
+    startRealtimeSubscription();
+  });
 });
 
 // Critical for 100+ concurrent users on Render/nginx:

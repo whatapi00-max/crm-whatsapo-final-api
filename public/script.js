@@ -3,8 +3,41 @@
 // Multi-Tenant Version
 // ============================================
 
+// ── Global Error Handlers — catch ANY uncaught errors ──
+window.addEventListener('error', (event) => {
+  const msg = event.message || 'Unknown error';
+  if (msg.includes('ResizeObserver') || msg.includes('Script error')) return; // ignore noise
+  if (typeof showToast === 'function') {
+    showToast('Unexpected error: ' + msg, 'error');
+  }
+});
+window.addEventListener('unhandledrejection', (event) => {
+  const reason = event.reason;
+  const msg = (reason && reason.message) ? reason.message : String(reason || 'Unknown async error');
+  if (msg.includes('401') || msg.includes('AbortError')) return; // auth redirects / aborted fetches
+  if (typeof showToast === 'function') {
+    showToast('Async error: ' + msg, 'error');
+  }
+});
+
 const API_BASE = '';
 const REFRESH_INTERVAL = 45000; // 45s — fallback polling when SSE is not connected
+
+// ── Report errors to admin notification panel ──
+const _reportedErrors = new Map(); // throttle: same msg once per 5 min
+function reportErrorToAdmin(message, context) {
+  const key = String(message).substring(0, 120);
+  const now = Date.now();
+  if (_reportedErrors.has(key) && now - _reportedErrors.get(key) < 300000) return;
+  _reportedErrors.set(key, now);
+  const tid = (typeof TENANT_ID !== 'undefined') ? TENANT_ID : null;
+  if (!tid) return; // no tenant context yet
+  fetch('/api/report-error', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': tid },
+    body: JSON.stringify({ error: String(message).substring(0, 500), context: String(context || '').substring(0, 200) })
+  }).catch(() => {}); // fire-and-forget, don't recurse
+}
 
 // ── Realtime SSE state ─────────────────────
 let sseSource = null;
@@ -100,7 +133,9 @@ function startSessionCheck() {
       if (res.status === 401) {
         window.location.href = '/login';
       }
-    } catch {}
+    } catch (err) {
+      showToast('Session check failed: ' + (err.message || 'Server unreachable'), 'warning');
+    }
   }, 300000);
 }
 
@@ -113,7 +148,9 @@ async function checkWarnOnce() {
     if (!res.ok) return;
     const data = await res.json();
     if (data.warned) triggerAdminFreeze(data.message, data.remaining_seconds || 60);
-  } catch {}
+  } catch (err) {
+    console.warn('Warning check failed:', err);
+  }
 }
 
 function startWarningPoll() {
@@ -126,7 +163,9 @@ function startWarningPoll() {
       if (!res.ok) return;
       const data = await res.json();
       if (data.warned) triggerAdminFreeze(data.message, data.remaining_seconds || 60);
-    } catch {}
+    } catch (err) {
+      console.warn('Warning poll failed:', err);
+    }
   }, 30000); // poll every 30 seconds
 }
 
@@ -361,7 +400,7 @@ function initEventListeners() {
       await apiPut(`/api/leads/${encodeURIComponent(currentPhone)}`, { status: newStatus });
     } catch (err) {
       if (err.message && err.message.includes('401')) return;
-      console.error('Status update error:', err);
+      showToast('Status update failed: ' + (err.message || 'Unknown error'), 'error');
     }
   });
 
@@ -594,7 +633,8 @@ async function loadActiveChats(force) {
       renderLeadsList();
     }
   } catch (err) {
-    console.error('Load chats error:', err);
+    if (err.message && err.message.includes('401')) return;
+    showToast('Failed to load chats: ' + (err.message || 'Unknown error'), 'error');
   }
 }
 
@@ -810,7 +850,7 @@ async function loadChat(phone, forceRender) {
       if (currentPhone === phone) renderMessages(messages);
     }
   } catch (err) {
-    console.error('Load chat error:', err);
+    if (err.message && !err.message.includes('401')) showToast('Failed to load messages: ' + (err.message || 'Unknown error'), 'error');
     if (!messageCache.has(phone)) {
       $('#chat-messages').innerHTML = `
         <div class="text-center py-8">
@@ -891,12 +931,14 @@ function renderMessages(messages) {
       contentHtml = `<div class="whitespace-pre-wrap">${escapeHtml(msg.message)}</div>`;
     }
 
+    const failedStyle = (isOutgoing && msg.status === 'failed') ? ' style="border-color: rgba(239,68,68,0.4)"' : '';
+
     return `
       ${dateSeparator}
       <div class="${alignClass}">
-        <div class="msg-bubble ${bubbleClass}">
+        <div class="msg-bubble ${bubbleClass}"${failedStyle}>
           ${contentHtml}
-          <div class="msg-time ${isOutgoing ? 'text-right' : ''}">${formatTime(msg.created_at)}${isOutgoing ? ' ✓✓' : ''}</div>
+          <div class="msg-time ${isOutgoing ? 'text-right' : ''}">${formatTime(msg.created_at)}${isOutgoing ? (msg.status === 'failed' ? ' ❌' : ' ✓✓') : ''}</div>
         </div>
       </div>`;
   }).join('');
@@ -961,6 +1003,9 @@ async function sendMessage() {
     const errMsg = err.message || 'Failed to send';
     if (errMsg.includes('Anti-spam') || errMsg.includes('frozen')) {
       triggerAdminFreeze(errMsg, 60);
+    }
+    if (errMsg.includes('banned') || errMsg.includes('restricted')) {
+      checkConnection(); // Refresh connection status to show banned state
     }
     showToast(errMsg, 'error');
   } finally {
@@ -1503,6 +1548,9 @@ async function sendVoiceRecording() {
     if (errMsg.includes('Anti-spam') || errMsg.includes('frozen')) {
       triggerAdminFreeze(errMsg, 60);
     }
+    if (errMsg.includes('banned') || errMsg.includes('restricted')) {
+      checkConnection();
+    }
     showToast(errMsg, 'error');
   } finally {
     isSending = false;
@@ -1617,6 +1665,9 @@ async function sendImage() {
     if (errMsg.includes('Anti-spam') || errMsg.includes('frozen')) {
       triggerAdminFreeze(errMsg, 60);
     }
+    if (errMsg.includes('banned') || errMsg.includes('restricted')) {
+      checkConnection();
+    }
     showToast(errMsg, 'error');
   } finally {
     isSending = false;
@@ -1634,7 +1685,7 @@ async function loadQuickReplies() {
     quickReplies = await apiGet('/api/quick-replies');
     renderQuickRepliesBar();
   } catch (err) {
-    console.error('Quick replies error:', err);
+    if (err.message && !err.message.includes('401')) showToast('Failed to load quick replies: ' + err.message, 'error');
   }
 }
 
@@ -1717,8 +1768,8 @@ async function resolvePhone() {
     } else {
       showToast(result.message || 'Could not detect phone', 'info');
     }
-  } catch {
-    showToast('Detection failed', 'error');
+  } catch (err) {
+    showToast('Phone detection failed: ' + (err.message || 'Unknown error'), 'error');
   }
   btn.disabled = false;
   btn.textContent = 'Detect';
@@ -1736,8 +1787,8 @@ async function deleteLead() {
     isInfoPanelOpen = false;
     loadActiveChats();
     showToast('Lead deleted', 'success');
-  } catch {
-    showToast('Delete failed', 'error');
+  } catch (err) {
+    showToast('Delete lead failed: ' + (err.message || 'Unknown error'), 'error');
   }
 }
 
@@ -1785,7 +1836,7 @@ async function loadContactsPage() {
       </tr>
     `).join('');
   } catch (err) {
-    console.error('Contacts page error:', err);
+    if (err.message && !err.message.includes('401')) showToast('Failed to load contacts: ' + err.message, 'error');
   }
 }
 
@@ -1832,8 +1883,8 @@ async function exportCSV() {
     a.click();
     URL.revokeObjectURL(url);
     showToast('Export downloaded', 'success');
-  } catch {
-    showToast('Export failed', 'error');
+  } catch (err) {
+    showToast('Export failed: ' + (err.message || 'Unknown error'), 'error');
   }
 }
 
@@ -1845,7 +1896,7 @@ async function loadBroadcasts() {
     broadcasts = await apiGet('/api/broadcasts');
     renderBroadcasts();
   } catch (err) {
-    console.error('Broadcasts error:', err);
+    if (err.message && !err.message.includes('401')) showToast('Failed to load broadcasts: ' + err.message, 'error');
   }
 }
 
@@ -1915,7 +1966,7 @@ async function sendBroadcast(id) {
           const bcType = bc.status === 'completed' ? 'success' : bc.status === 'cancelled' ? 'info' : 'error';
           showToast(`Broadcast ${bc.status}: ${bc.sent_count || 0} sent, ${bc.failed_count || 0} failed`, bcType);
         }
-      } catch { clearInterval(pollInterval); }
+      } catch (err) { showToast('Broadcast status check failed: ' + (err.message || 'Unknown error'), 'warning'); clearInterval(pollInterval); }
     }, 5000);
   } catch (err) {
     showToast(err.message || 'Failed to send', 'error');
@@ -1939,8 +1990,8 @@ async function deleteBroadcast(id) {
     await apiDelete(`/api/broadcasts/${id}`);
     showToast('Broadcast deleted', 'success');
     loadBroadcasts();
-  } catch {
-    showToast('Delete failed', 'error');
+  } catch (err) {
+    showToast('Delete broadcast failed: ' + (err.message || 'Unknown error'), 'error');
   }
 }
 
@@ -1952,7 +2003,7 @@ async function loadAutoReplies() {
     autoReplies = await apiGet('/api/auto-replies');
     renderAutoReplies();
   } catch (err) {
-    console.error('Auto-replies error:', err);
+    if (err.message && !err.message.includes('401')) showToast('Failed to load auto-replies: ' + err.message, 'error');
   }
 }
 
@@ -2026,8 +2077,8 @@ async function toggleAutoReply(id, active) {
     await apiPut(`/api/auto-replies/${id}`, { is_active: active });
     showToast(active ? 'Rule enabled' : 'Rule disabled', 'success');
     loadAutoReplies();
-  } catch {
-    showToast('Toggle failed', 'error');
+  } catch (err) {
+    showToast('Toggle auto-reply failed: ' + (err.message || 'Unknown error'), 'error');
   }
 }
 
@@ -2037,8 +2088,8 @@ async function deleteAutoReply(id) {
     await apiDelete(`/api/auto-replies/${id}`);
     showToast('Rule deleted', 'success');
     loadAutoReplies();
-  } catch {
-    showToast('Delete failed', 'error');
+  } catch (err) {
+    showToast('Delete rule failed: ' + (err.message || 'Unknown error'), 'error');
   }
 }
 
@@ -2100,7 +2151,7 @@ async function loadAnalytics() {
       }).join('');
     }
   } catch (err) {
-    console.error('Analytics error:', err);
+    if (err.message && !err.message.includes('401')) showToast('Failed to load analytics: ' + err.message, 'error');
   }
 }
 
@@ -2112,7 +2163,7 @@ async function loadScheduled() {
     scheduledMsgs = await apiGet('/api/scheduled');
     renderScheduled();
   } catch (err) {
-    console.error('Scheduled error:', err);
+    if (err.message && !err.message.includes('401')) showToast('Failed to load scheduled messages: ' + err.message, 'error');
   }
 }
 
@@ -2170,8 +2221,8 @@ async function deleteScheduled(id) {
     await apiDelete(`/api/scheduled/${id}`);
     showToast('Scheduled message cancelled', 'success');
     loadScheduled();
-  } catch {
-    showToast('Delete failed', 'error');
+  } catch (err) {
+    showToast('Cancel scheduled message failed: ' + (err.message || 'Unknown error'), 'error');
   }
 }
 
@@ -2247,8 +2298,8 @@ async function deleteQR(id) {
     showToast('Quick reply deleted', 'success');
     loadQuickRepliesPage();
     loadQuickReplies();
-  } catch {
-    showToast('Delete failed', 'error');
+  } catch (err) {
+    showToast('Delete quick reply failed: ' + (err.message || 'Unknown error'), 'error');
   }
 }
 
@@ -2314,6 +2365,41 @@ function startRealtime() {
     loadActiveChats(true);
   });
 
+  // WhatsApp number got banned — immediate notification
+  es.addEventListener('wa_banned', (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      showToast('🚫 Your WhatsApp number has been BANNED/RESTRICTED by Meta!\n' + (data.reason || 'Messages will not be delivered.'), 'error');
+      // Update connection status immediately
+      checkConnection();
+    } catch (_) {
+      showToast('🚫 Your WhatsApp number has been BANNED/RESTRICTED!', 'error');
+    }
+  });
+
+  // Message delivery failed — Meta rejected the message after we sent it
+  es.addEventListener('message_failed', (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      const phone = data.phone;
+      const errMsg = data.error || 'Message not delivered';
+      showToast(`❌ Message to ${phone || 'recipient'} FAILED: ${errMsg}`, 'error');
+
+      // If this chat is currently open, reload to show updated status
+      if (currentPhone === phone && currentPage === 'inbox') {
+        messageCache.delete(phone);
+        loadChat(phone, true);
+      }
+
+      // Update connection status in case it's a ban
+      if (data.error_code && [131031, 368, 131026, 131056].includes(data.error_code)) {
+        checkConnection();
+      }
+    } catch (_) {
+      showToast('❌ A message failed to deliver!', 'error');
+    }
+  });
+
   es.onerror = () => {
     sseConnected = false;
     es.close();
@@ -2349,22 +2435,42 @@ function startAutoRefresh() {
 }
 
 // ══════════════════════════════════════════════
-// TOAST NOTIFICATIONS
+// TOAST NOTIFICATIONS (BIG & VISIBLE)
 // ══════════════════════════════════════════════
+const TOAST_ICONS = {
+  success: '✅',
+  error: '❌',
+  warning: '⚠️',
+  info: 'ℹ️'
+};
+const TOAST_TITLES = {
+  success: 'Success',
+  error: 'Error',
+  warning: 'Warning',
+  info: 'Info'
+};
 function showToast(message, type = 'info') {
+  // Report errors to admin notification panel
+  if (type === 'error' && typeof reportErrorToAdmin === 'function') {
+    reportErrorToAdmin(message, window.location.pathname);
+  }
   const container = $('#toast-container');
   // Limit to 5 stacked toasts — remove oldest if over
   const existing = container.querySelectorAll('.toast');
   if (existing.length >= 5) existing[0].remove();
   const toast = document.createElement('div');
   toast.className = `toast toast-${type}`;
-  toast.textContent = message;
+  const icon = TOAST_ICONS[type] || 'ℹ️';
+  const title = TOAST_TITLES[type] || 'Notice';
+  toast.innerHTML = `<span class="toast-icon">${icon}</span><div class="toast-body"><div class="toast-title">${title}</div><div class="toast-msg">${escapeHtml(String(message))}</div></div><button class="toast-close" onclick="this.parentElement.remove()">&times;</button>`;
   container.appendChild(toast);
+  // Click anywhere on toast to dismiss
+  toast.addEventListener('click', (e) => { if (e.target.tagName !== 'BUTTON') { toast.classList.add('hiding'); setTimeout(() => toast.remove(), 300); } });
+  const duration = type === 'error' ? 8000 : type === 'warning' ? 6000 : 4000;
   setTimeout(() => {
-    // Use CSS class so transition fires properly (not same-frame style set)
     toast.classList.add('hiding');
     setTimeout(() => toast.remove(), 300);
-  }, 3000);
+  }, duration);
 }
 
 // ══════════════════════════════════════════════

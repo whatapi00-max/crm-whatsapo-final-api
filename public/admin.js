@@ -7,6 +7,19 @@ let lastCreatedCreds = null;
 let bulkCreatedCreds = [];
 let toastCounter = 0;
 
+// ── Global Error Handlers — catch ANY uncaught errors ──
+window.addEventListener('error', (event) => {
+  const msg = event.message || 'Unknown error';
+  if (msg.includes('ResizeObserver') || msg.includes('Script error')) return;
+  if (typeof toast === 'function') toast('Unexpected error: ' + msg, 'error');
+});
+window.addEventListener('unhandledrejection', (event) => {
+  const reason = event.reason;
+  const msg = (reason && reason.message) ? reason.message : String(reason || 'Unknown async error');
+  if (msg.includes('401') || msg.includes('AbortError')) return;
+  if (typeof toast === 'function') toast('Async error: ' + msg, 'error');
+});
+
 // ── Theme ───────────────────────────────────
 function toggleTheme() {
   const html = document.documentElement;
@@ -59,7 +72,7 @@ async function loadTenants() {
     renderTenants();
     updateCountBadge();
   } catch (err) {
-    console.error('Failed to load tenants:', err);
+    toast('Failed to load marketers: ' + err.message, 'error');
   }
 }
 
@@ -77,7 +90,7 @@ async function loadStats() {
     document.getElementById('stat-disconnected-info').textContent = `${total - connected} disconnected`;
     document.getElementById('stat-active-info').textContent = `${tenants.filter(t => t.is_active).length} active`;
   } catch (err) {
-    console.error('Failed to load stats:', err);
+    toast('Failed to load stats: ' + err.message, 'error');
   }
 }
 
@@ -158,6 +171,9 @@ function renderTenantRows(list) {
             ${t.wa_status === 'connected'
               ? `<button class="btn-sm btn-edit" onclick="openWAConfigModal(${t.id}, '${escapeHtml(t.name)}')">⚙️ API Config</button>
                  <button class="btn-sm btn-disconnect" onclick="disconnectWA(${t.id})">Disconnect</button>`
+              : t.wa_status === 'banned'
+              ? `<button class="btn-sm btn-edit" onclick="openWAConfigModal(${t.id}, '${escapeHtml(t.name)}')">⚙️ API Config</button>
+                 <button class="btn-sm" style="background:rgba(249,115,22,0.12);color:#f97316;border:none;cursor:pointer" onclick="openWAConfigModal(${t.id}, '${escapeHtml(t.name)}')">🔄 Reconfigure</button>`
               : `<button class="btn-sm btn-connect" onclick="openWAConfigModal(${t.id}, '${escapeHtml(t.name)}')">Configure API</button>`
             }
             <button class="btn-sm btn-edit" onclick="openEditModal(${t.id})">Edit</button>
@@ -175,6 +191,7 @@ function renderTenantRows(list) {
 function getWABadge(status) {
   switch (status) {
     case 'connected': return '<span class="badge badge-connected"><span class="dot dot-green"></span> Connected</span>';
+    case 'banned': return '<span class="badge badge-banned"><span class="dot dot-yellow"></span> Banned</span>';
     case 'not_configured':
     default: return '<span class="badge badge-disconnected"><span class="dot dot-red"></span> Not Configured</span>';
   }
@@ -187,7 +204,9 @@ async function loadTenantStats(id) {
     if (el) {
       el.innerHTML = `<span class="text-xs dark:text-gray-400 text-gray-500">${stats.leads} leads &bull; ${stats.messages_today} msgs</span>`;
     }
-  } catch {}
+  } catch (err) {
+    console.warn('Tenant stats load failed for #' + id);
+  }
 }
 
 // ── Create / Edit Tenant ────────────────────
@@ -441,7 +460,7 @@ async function openWAConfigModal(id, name) {
       document.getElementById('wac-access-token').required = true;
     }
   } catch (e) {
-    console.error('Load WA config error:', e);
+    toast('Failed to load WhatsApp config: ' + (e.message || 'Unknown error'), 'error');
   }
 
   document.getElementById('modal-wa-config').classList.remove('hidden');
@@ -616,7 +635,7 @@ async function loadStorageStats() {
     renderStorageAlerts(storage);
 
   } catch (err) {
-    console.error('Failed to load storage stats:', err);
+    toast('Failed to load storage stats: ' + err.message, 'error');
   }
 }
 
@@ -628,8 +647,8 @@ function renderTenantStorage(list) {
   }
 
   body.innerHTML = list.map(t => {
-    const waColor = t.wa_status === 'connected' ? 'text-green-500' : 'dark:text-gray-600 text-gray-400';
-    const waLabel = t.wa_status === 'connected' ? 'Connected' : 'Not Configured';
+    const waColor = t.wa_status === 'connected' ? 'text-green-500' : t.wa_status === 'banned' ? 'text-orange-500' : 'dark:text-gray-600 text-gray-400';
+    const waLabel = t.wa_status === 'connected' ? 'Connected' : t.wa_status === 'banned' ? '⚠️ Banned' : 'Not Configured';
     const ramBadge = '<span class="text-[10px] dark:text-gray-600 text-gray-400">-</span>';
 
     return `
@@ -810,7 +829,7 @@ async function loadDashboard() {
     }
     grid.innerHTML = data.marketers.map((m, i) => renderMarketerCard(m, i)).join('');
   } catch (err) {
-    console.error('Dashboard load error:', err);
+    toast('Failed to load dashboard: ' + err.message, 'error');
     document.getElementById('dash-marketer-grid').innerHTML =
       '<div class="card p-8 text-center" style="grid-column:1/-1"><p class="text-sm text-red-500">Failed to load dashboard. Will retry shortly.</p></div>';
   }
@@ -820,6 +839,8 @@ function renderMarketerCard(m, idx) {
   const avatarClass = `avatar-grad-${idx % 6}`;
   const waStatusBadge = m.wa_status === 'connected'
     ? '<span class="badge badge-connected"><span class="dot dot-green"></span> Connected</span>'
+    : m.wa_status === 'banned'
+    ? '<span class="badge badge-banned"><span class="dot dot-yellow"></span> Banned</span>'
     : '<span class="badge badge-disconnected"><span class="dot dot-red"></span> Not Set</span>';
   const activeBadge = m.is_active
     ? '<span class="badge badge-active"><span class="dot dot-green"></span> Active</span>'
@@ -936,7 +957,9 @@ async function checkNotifBadge() {
   try {
     const data = await api('/api/admin/notifications');
     updateNotifBadge(data.unread);
-  } catch (_) {}
+  } catch (err) {
+    console.warn('Notification badge check failed:', err.message);
+  }
 }
 
 async function loadNotifications() {
@@ -949,7 +972,7 @@ async function loadNotifications() {
       updateNotifBadge(0);
     }
   } catch (err) {
-    console.error('Notifications error:', err);
+    toast('Failed to load notifications: ' + err.message, 'error');
   }
 }
 
@@ -1047,17 +1070,25 @@ function copyText(text, msg) {
   navigator.clipboard.writeText(text).then(() => toast(msg || 'Copied!', 'success'));
 }
 
+const TOAST_ICONS = { success: '✅', error: '❌', warning: '⚠️', info: 'ℹ️' };
+const TOAST_TITLES = { success: 'Success', error: 'Error', warning: 'Warning', info: 'Info' };
+
 function toast(msg, type = 'success') {
   const container = document.getElementById('toast-container');
   const id = ++toastCounter;
+  const icon = TOAST_ICONS[type] || 'ℹ️';
+  const title = TOAST_TITLES[type] || 'Notice';
   const item = document.createElement('div');
   item.className = `toast-item toast-${type}`;
   item.id = `toast-${id}`;
-  item.innerHTML = msg;
+  item.style.cssText = 'padding:14px 20px;font-size:14px;font-weight:600;min-width:320px;max-width:480px;display:flex;align-items:flex-start;gap:10px;cursor:pointer;position:relative;word-break:break-word;';
+  item.innerHTML = `<span style="font-size:1.3rem;flex-shrink:0">${icon}</span><div style="flex:1;min-width:0"><div style="font-weight:700;font-size:0.95rem;margin-bottom:2px">${title}</div><div style="font-size:0.85rem;font-weight:500;opacity:0.9">${escapeHtml(String(msg))}</div></div><button onclick="event.stopPropagation();this.parentElement.remove()" style="background:none;border:none;color:inherit;font-size:1.1rem;cursor:pointer;opacity:0.5;padding:2px 6px;position:absolute;top:6px;right:8px">&times;</button>`;
   container.appendChild(item);
+  item.addEventListener('click', () => { item.classList.remove('show'); setTimeout(() => item.remove(), 300); });
   requestAnimationFrame(() => item.classList.add('show'));
+  const duration = type === 'error' ? 8000 : type === 'warning' ? 6000 : 4000;
   setTimeout(() => {
     item.classList.remove('show');
     setTimeout(() => item.remove(), 300);
-  }, 3500);
+  }, duration);
 }
