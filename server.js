@@ -57,7 +57,15 @@ const supabaseFetch = async (url, options = {}) => {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 55000);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    // Detect Supabase/proxy 5xx errors that return raw HTML instead of JSON
+    if (!response.ok && response.status >= 500) {
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        throw new Error(`Database unavailable (HTTP ${response.status}) — Supabase may be paused or unreachable`);
+      }
+    }
+    return response;
   } finally {
     clearTimeout(timeoutId);
   }
@@ -172,11 +180,23 @@ function invalidateQuickReplyCache(tenantId) {
 // ── Admin Notifications Store (in-memory) ──
 const adminNotifications = [];
 let notifIdCounter = 0;
+function sanitizeNotifMessage(msg) {
+  if (!msg) return 'Unknown error';
+  const str = String(msg);
+  // Truncate and strip HTML — prevents raw 502 pages flooding notifications
+  if (str.trim().startsWith('<') || str.includes('</html>') || str.includes('<!DOCTYPE')) {
+    const codeMatch = str.match(/(\d{3}).*Bad [Gg]ateway|HTTP (\d{3})/i);
+    const code = (codeMatch && (codeMatch[1] || codeMatch[2])) || '502';
+    return `Database unavailable (HTTP ${code}) — Supabase may be paused or restarting. Check https://supabase.com/dashboard`;
+  }
+  return str.substring(0, 300);
+}
+
 function pushAdminNotif(type, message, tenantId, tenantName) {
   adminNotifications.unshift({
     id: ++notifIdCounter,
     type, // 'copy_paste', 'warn', 'error', 'info'
-    message,
+    message: sanitizeNotifMessage(message),
     tenant_id: tenantId || null,
     tenant_name: tenantName || null,
     timestamp: new Date().toISOString(),
@@ -2004,7 +2024,7 @@ app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
       ]);
 
       // Build 7-day chart: index 6 = today, index 0 = 6 days ago
-      const chart = new Array(7).fill(0);
+      const chart = new Array(7).fill(0); 
       const now = new Date();
       (weekData.data || []).forEach(row => {
         const d = Math.floor((now - new Date(row.created_at)) / 86400000);
