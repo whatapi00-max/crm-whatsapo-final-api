@@ -52,23 +52,47 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
 }
 
 // ── Supabase Client ─────────────────────────
-// Custom fetch with 55s timeout to allow Supabase free-tier wake-up (paused DB can take up to 60s)
+// Supabase Pro plan — DB is always on, no wake-up delay needed.
+// 20s timeout is generous for a live Pro instance; retries handle brief 502/503/504 blips.
 const supabaseFetch = async (url, options = {}) => {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 55000);
-  try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
+  const MAX_RETRIES = 2;
+  const RETRY_DELAYS_MS = [2000, 5000]; // Pro: 2s then 5s — blips are brief
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 20000); // 20s for Pro (was 55s for free-tier)
+    let response;
+    try {
+      response = await fetch(url, { ...options, signal: controller.signal });
+    } catch (fetchErr) {
+      clearTimeout(timeoutId);
+      if (isAbortError(fetchErr)) throw fetchErr; // never retry timeouts
+      if (attempt < MAX_RETRIES) {
+        console.warn(`⚠️  Supabase network error (attempt ${attempt + 1}/${MAX_RETRIES + 1}), retrying in ${RETRY_DELAYS_MS[attempt] / 1000}s — transient blip`);
+        await delay(RETRY_DELAYS_MS[attempt]);
+        continue;
+      }
+      throw fetchErr;
+    }
+    clearTimeout(timeoutId);
+
     // Detect Supabase/proxy 5xx errors that return raw HTML instead of JSON
     if (!response.ok && response.status >= 500) {
       const contentType = response.headers.get('content-type') || '';
       if (!contentType.includes('application/json')) {
-        throw new Error(`Database unavailable (HTTP ${response.status}) — Supabase may be paused or unreachable`);
+        // Retry transient gateway errors before giving up
+        if ([502, 503, 504].includes(response.status) && attempt < MAX_RETRIES) {
+          console.warn(`⚠️  Supabase HTTP ${response.status} (attempt ${attempt + 1}/${MAX_RETRIES + 1}), retrying in ${RETRY_DELAYS_MS[attempt] / 1000}s — transient blip`);
+          await delay(RETRY_DELAYS_MS[attempt]);
+          continue;
+        }
+        throw new Error(`Database unavailable (HTTP ${response.status}) — Supabase transient error, please retry`);
       }
     }
     return response;
-  } finally {
-    clearTimeout(timeoutId);
   }
+  // Fallback — should not be reached but satisfies linters
+  throw new Error('Supabase fetch failed after retries');
 };
 
 const supabase = createClient(
@@ -149,7 +173,7 @@ async function cacheIncomingMedia(tenantId, convId, mediaId) {
 // ── Auto-Reply Rules Cache (avoid DB query on every incoming message) ──
 // Maps tenantId -> { rules: [...], ts: number }
 const autoReplyCache = new Map();
-const AUTO_REPLY_CACHE_TTL = 60000; // 60s
+const AUTO_REPLY_CACHE_TTL = 300000; // 5 min — rules rarely change, avoids DB hit on every message
 function getAutoReplyCached(tenantId) {
   const c = autoReplyCache.get(String(tenantId));
   if (c && (Date.now() - c.ts) < AUTO_REPLY_CACHE_TTL) return c.rules;
@@ -1080,6 +1104,8 @@ async function handleIncomingWebhook(entry) {
           }
         } else {
           console.log(`✅ Saved conversation id=${insertedRows?.[0]?.id}, media_url=${insertedRows?.[0]?.media_url || 'NULL'}`);
+          // Bust message cache so marketer's next load sees this incoming message immediately
+          responseCache.delete(`msgs_${resolvedTenantId}_${phone}`);
           // Cache incoming media binary in background for fast proxy serving
           if (incomingMediaId && insertedRows?.[0]?.id) {
             cacheIncomingMedia(resolvedTenantId, insertedRows[0].id, incomingMediaId);
@@ -1105,16 +1131,18 @@ async function handleIncomingWebhook(entry) {
             last_message_at: new Date().toISOString()
           });
 
-          try {
-            await supabase.from('activity_log').insert({
-              tenant_id: resolvedTenantId, phone, action: 'lead_created',
-              details: `New lead from ${source}: ${contactName}`
-            });
-          } catch (_) {}
+          // Fire-and-forget: activity_log is non-critical, don't block the hot webhook path
+          supabase.from('activity_log').insert({
+            tenant_id: resolvedTenantId, phone, action: 'lead_created',
+            details: `New lead from ${source}: ${contactName}`
+          }).then(() => {}).catch(() => {});
         } else {
-          await supabase.from('leads').update({
+          // Fire-and-forget: updating last_message_at doesn't need to block here
+          // (webhook already responded 200; we just need it written eventually)
+          supabase.from('leads').update({
             last_message_at: new Date().toISOString(), real_phone: phone
-          }).eq('tenant_id', resolvedTenantId).eq('phone', phone);
+          }).eq('tenant_id', resolvedTenantId).eq('phone', phone)
+            .then(() => {}).catch(() => {});
         }
 
         // Mark this phone as a warm inbound contact (CTWA lead)
@@ -1856,12 +1884,17 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
 app.get('/api/admin/tenants/:id/stats', adminAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
+    const cacheKey = `admin_tenant_stats_${id}`;
+    const cached = getCachedResponse(cacheKey);
+    if (cached) return res.json(cached);
     const [leadsRes, msgsRes] = await Promise.all([
       supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', id),
       supabase.from('conversations').select('id', { count: 'exact', head: true })
         .eq('tenant_id', id).eq('direction', 'outgoing').gte('created_at', new Date(Date.now() - 86400000).toISOString())
     ]);
-    res.json({ leads: leadsRes.count || 0, messages_today: msgsRes.count || 0 });
+    const result = { leads: leadsRes.count || 0, messages_today: msgsRes.count || 0 };
+    setCachedResponse(cacheKey, result, 60000); // 60s cache
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch tenant stats' });
   }
@@ -1968,7 +2001,7 @@ app.get('/api/admin/storage/tenants', adminAuth, async (req, res) => {
     }));
 
     breakdown.sort((a, b) => b.total_rows - a.total_rows);
-    setCachedResponse(cacheKey, breakdown, 60000); // 60s cache
+    setCachedResponse(cacheKey, breakdown, 300000); // 5 min — storage doesn't change rapidly
     res.json(breakdown);
   } catch (err) {
     console.error('Tenant storage breakdown error:', err.message);
@@ -2091,7 +2124,7 @@ app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
       total_messages_week: marketers.reduce((s, m) => s + m.stats.messages_week, 0),
       copy_paste_alerts: marketers.filter(m => m.copy_paste_warning).length,
     };
-    setCachedResponse(cacheKey, result, 120000); // 120s cache
+    setCachedResponse(cacheKey, result, 300000); // 5 min — admin dashboard is expensive, refresh rarely
     res.json(result);
   } catch (err) {
     if (!isAbortError(err)) console.error('Dashboard error:', err.message);
@@ -2257,6 +2290,8 @@ app.post('/api/send-reply', tenantAuth, sendLimiter, async (req, res) => {
         .update({ last_message_at: now })
         .eq('tenant_id', req.tenantId).eq('phone', cleanedPhone)
     ]);
+    // Bust message cache so next load fetches the new message
+    responseCache.delete(`msgs_${req.tenantId}_${cleanedPhone}`);
 
     res.json({ success: true, phone: cleanedPhone, timestamp: now, spam_frozen: false });
   } catch (err) {
@@ -2490,13 +2525,18 @@ app.get('/api/audio-proxy/:conversationId', tenantAuth, (req, res) => {
 app.get('/api/messages/:phone', tenantAuth, async (req, res) => {
   try {
     const phone = req.params.phone.replace(/\D/g, '');
+    const cacheKey = `msgs_${req.tenantId}_${phone}`;
+    const cached = getCachedResponse(cacheKey);
+    if (cached) { res.set('Cache-Control', 'private, max-age=5'); return res.json(cached); }
     const { data, error } = await supabase.from('conversations')
       .select('id, phone, message, direction, status, created_at, media_url')
       .eq('tenant_id', req.tenantId).eq('phone', phone)
       .order('created_at', { ascending: true }).limit(200);
     if (error) throw error;
+    const result = data || [];
+    setCachedResponse(cacheKey, result, 10000); // 10s cache — SSE handles live updates
     res.set('Cache-Control', 'private, max-age=5');
-    res.json(data || []);
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch chat' });
   }
@@ -2599,9 +2639,24 @@ const responseCache = new Map(); // key -> { data, ts }
 const RESP_CACHE_TTL = 45000; // 45s for stats
 const RESP_CACHE_TTL_LONG = 90000; // 90s for analytics
 
+// Separate stale-fallback store: keeps last-known-good data for up to 5 min.
+// Used to serve marketers cached results when Supabase is briefly unavailable.
+const staleCache = new Map(); // key -> { data, ts }
+const STALE_CACHE_TTL = 300000; // 5 minutes
+
 function getCachedResponse(key) {
   const cached = responseCache.get(key);
   if (cached && (Date.now() - cached.ts) < cached.ttl) return cached.data;
+  return null;
+}
+
+function setStaleCachedResponse(key, data) {
+  staleCache.set(key, { data, ts: Date.now() });
+}
+
+function getStaleCachedResponse(key) {
+  const entry = staleCache.get(key);
+  if (entry && (Date.now() - entry.ts) < STALE_CACHE_TTL) return entry.data;
   return null;
 }
 
@@ -2636,7 +2691,7 @@ app.get('/api/stats', tenantAuth, async (req, res) => {
       supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('status', 'interested'),
       supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('status', 'contacted'),
       supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('status', 'lost'),
-      supabase.from('leads').select('revenue').eq('tenant_id', tid).gt('revenue', 0),
+      supabase.from('leads').select('revenue').eq('tenant_id', tid).gt('revenue', 0).limit(3000), // capped — avoids unbounded row fetch
       supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).gte('created_at', since24h),
       supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('direction', 'incoming').gte('created_at', since24h),
       supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('direction', 'outgoing').gte('created_at', since24h),
@@ -2829,10 +2884,15 @@ app.delete('/api/auto-replies/:id', tenantAuth, async (req, res) => {
 // ── Broadcasts ──────────────────────────────
 app.get('/api/broadcasts', tenantAuth, async (req, res) => {
   try {
+    const cacheKey = `broadcasts_${req.tenantId}`;
+    const cached = getCachedResponse(cacheKey);
+    if (cached) return res.json(cached);
     const { data, error } = await supabase.from('broadcasts')
       .select('*').eq('tenant_id', req.tenantId).order('created_at', { ascending: false });
     if (error) throw error;
-    res.json(data || []);
+    const result = data || [];
+    setCachedResponse(cacheKey, result, 30000); // 30s cache
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch broadcasts' });
   }
@@ -3025,8 +3085,12 @@ async function sendBroadcastAsync(tenantId, broadcastId, message) {
 app.delete('/api/broadcasts/:id', tenantAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    await supabase.from('broadcast_recipients').delete().eq('broadcast_id', id);
-    await supabase.from('broadcasts').delete().eq('id', id).eq('tenant_id', req.tenantId);
+    // Parallel delete — no dependency between recipients and broadcast row
+    await Promise.all([
+      supabase.from('broadcast_recipients').delete().eq('broadcast_id', id),
+      supabase.from('broadcasts').delete().eq('id', id).eq('tenant_id', req.tenantId)
+    ]);
+    responseCache.delete(`broadcasts_${req.tenantId}`); // bust list cache
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete broadcast' });
@@ -3036,10 +3100,15 @@ app.delete('/api/broadcasts/:id', tenantAuth, async (req, res) => {
 // ── Scheduled Messages ──────────────────────
 app.get('/api/scheduled', tenantAuth, async (req, res) => {
   try {
+    const cacheKey = `scheduled_${req.tenantId}`;
+    const cached = getCachedResponse(cacheKey);
+    if (cached) return res.json(cached);
     const { data, error } = await supabase.from('scheduled_messages')
       .select('*').eq('tenant_id', req.tenantId).order('scheduled_at', { ascending: true });
     if (error) throw error;
-    res.json(data || []);
+    const result = data || [];
+    setCachedResponse(cacheKey, result, 30000); // 30s cache
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch scheduled messages' });
   }
@@ -3058,6 +3127,7 @@ app.post('/api/scheduled', tenantAuth, async (req, res) => {
       scheduled_at: new Date(scheduled_at).toISOString(), status: 'pending'
     }).select().single();
     if (error) throw error;
+    responseCache.delete(`scheduled_${req.tenantId}`); // bust list cache
     res.json(data);
   } catch (err) {
     res.status(500).json({ error: 'Failed to schedule message' });
@@ -3070,6 +3140,7 @@ app.delete('/api/scheduled/:id', tenantAuth, async (req, res) => {
     await supabase.from('scheduled_messages')
       .update({ status: 'cancelled' }).eq('id', id)
       .eq('tenant_id', req.tenantId).eq('status', 'pending');
+    responseCache.delete(`scheduled_${req.tenantId}`); // bust list cache
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to cancel scheduled message' });
@@ -3401,11 +3472,35 @@ app.get('/api/active-chats', tenantAuth, async (req, res) => {
       unread_count: unreadMap.get(lead.phone) || 0
     }));
 
-    if (!since) setCachedResponse(`active_chats_${tid}`, chats, 10000);
+    if (!since) {
+      setCachedResponse(`active_chats_${tid}`, chats, 10000);
+      // Always update stale fallback so marketers get last-known-good data during outages
+      setStaleCachedResponse(`active_chats_stale_${tid}`, chats);
+    }
     res.json(chats);
   } catch (err) {
     console.error('Active chats error:', err.message);
-    pushAdminNotif('error', `Active chats load failed: ${err.message}`, req.tenantId, req.tenantName);
+
+    // If DB is temporarily unavailable, serve stale cached data so marketers are unaffected
+    const isDbTransient = err.message && (
+      err.message.includes('Database unavailable') ||
+      err.message.includes('502') || err.message.includes('503') || err.message.includes('504')
+    );
+    if (isDbTransient) {
+      const stale = getStaleCachedResponse(`active_chats_stale_${req.tenantId}`);
+      if (stale) {
+        console.warn(`⚠️  Serving stale active-chats for tenant ${req.tenantId} (DB transient error)`);
+        res.set('X-Stale-Data', 'true');
+        return res.json(stale);
+      }
+    }
+
+    // Only push admin notification if not a repeated transient flutter (throttled to once per 2 min per tenant)
+    const notifKey = `active_chats_err_${req.tenantId}`;
+    if (!getCachedResponse(notifKey)) {
+      pushAdminNotif('error', `Active chats load failed: ${err.message}`, req.tenantId, req.tenantName);
+      setCachedResponse(notifKey, true, 120000); // suppress duplicate notifs for 2 min
+    }
     res.status(500).json({ error: 'Failed to fetch active chats' });
   }
 });

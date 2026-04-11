@@ -634,6 +634,18 @@ async function loadActiveChats(force) {
     }
   } catch (err) {
     if (err.message && err.message.includes('401')) return;
+    // If the marketer already has chats loaded, don't show a scary toast for a transient DB error.
+    // The server will retry automatically; the UI will simply try again on the next poll cycle.
+    const isTransient = err.message && (
+      err.message.includes('502') || err.message.includes('503') ||
+      err.message.includes('504') || err.message.includes('Database unavailable') ||
+      err.message.includes('API error: 500')
+    );
+    if (isTransient && activeChats.length > 0) {
+      // Silently ignore — existing data stays on screen, refresh will resolve it automatically
+      console.warn('Active chats refresh skipped (DB transient):', err.message);
+      return;
+    }
     showToast('Failed to load chats: ' + (err.message || 'Unknown error'), 'error');
   }
 }
