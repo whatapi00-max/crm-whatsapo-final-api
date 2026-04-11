@@ -237,6 +237,8 @@ class CloudAPIManager {
       cfg.banned_reason = reason || 'Unknown';
       cfg.banned_at = new Date().toISOString();
       console.error(`🚫 [Tenant ${tenantId}] WhatsApp number BANNED: ${reason}`);
+      // Immediately bust the admin tenants cache so next poll sees banned state
+      responseCache.delete('admin_tenants');
       // Persist to DB (fire-and-forget)
       supabase.from('tenants').update({
         wa_banned: true,
@@ -246,6 +248,8 @@ class CloudAPIManager {
       }).eq('id', tenantId).then(() => {}).catch(() => {});
       // Push real-time ban notification to any open CRM tabs for this tenant
       try { broadcastToTenant(tenantId, 'wa_banned', { reason: cfg.banned_reason, banned_at: cfg.banned_at }); } catch (_) {}
+      // Push real-time ban notification to any open admin tabs (immediate)
+      try { broadcastToAdmin('tenant_banned', { tenant_id: Number(tenantId), reason: cfg.banned_reason, banned_at: cfg.banned_at }); } catch (_) {}
     }
   }
 
@@ -479,7 +483,7 @@ class CloudAPIManager {
       const errCode = data.error?.code;
       const errMsg = data.error?.message || data.error?.error_data?.details || JSON.stringify(data.error) || 'Cloud API error';
       // Check for ban-related errors
-      if (errCode === 131031 || errCode === 368 || errCode === 131026) {
+      if (errCode === 131031 || errCode === 368 || errCode === 131026 || errCode === 131056) {
         this.markBanned(tenantId, `Error ${errCode}: ${errMsg}`);
       }
       throw new Error(errMsg);
@@ -2196,7 +2200,8 @@ app.get('/api/connection-status', tenantAuth, (req, res) => {
     result.banned_reason = cfg.banned_reason || 'Unknown';
     result.banned_at = cfg.banned_at || null;
   }
-  res.set('Cache-Control', 'private, max-age=10');
+  // No caching — status changes (especially bans) must be visible immediately
+  res.set('Cache-Control', 'no-store');
   res.json(result);
 });
 
@@ -3163,6 +3168,17 @@ function broadcastToTenant(tenantId, event, data) {
   }
 }
 
+// ── Admin SSE (real-time push to all open admin tabs) ────────────────────────
+const adminSseClients = new Set(); // Set<res>
+
+function broadcastToAdmin(event, data) {
+  if (adminSseClients.size === 0) return;
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of [...adminSseClients]) {
+    try { res.write(payload); } catch (_) { adminSseClients.delete(res); }
+  }
+}
+
 // Single global Supabase realtime channel for all tenants
 let realtimeChannel = null;
 
@@ -3239,6 +3255,82 @@ app.get('/api/events', tenantAuth, (req, res) => {
 
   // Ensure Realtime subscription is running
   startRealtimeSubscription();
+});
+
+// ── Admin SSE Endpoint (real-time push to admin dashboard) ──
+app.get('/api/admin/events', adminAuth, (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.flushHeaders();
+  res.write('event: connected\ndata: {}\n\n');
+
+  adminSseClients.add(res);
+
+  const heartbeat = setInterval(() => {
+    try { res.write(':heartbeat\n\n'); } catch (_) { clearInterval(heartbeat); }
+  }, 25000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    adminSseClients.delete(res);
+  });
+});
+
+// ── Proactive Ban Checker ────────────────────────────────────
+// Periodically pings WhatsApp API for ALL configured APIs and marks ban
+// immediately — no need to wait for a failed message send.
+async function proactiveBanCheck() {
+  if (waManager.configs.size === 0) return;
+  for (const [tenantId, cfg] of waManager.configs) {
+    if (cfg.banned) continue; // already known
+    if (!cfg.phone_number_id || !cfg.access_token) continue;
+    try {
+      const controller = new AbortController();
+      const tid = setTimeout(() => controller.abort(), 10000);
+      const resp = await fetch(
+        `https://graph.facebook.com/${GRAPH_API_VERSION}/${cfg.phone_number_id}?fields=id,status,quality_rating`,
+        { headers: { 'Authorization': `Bearer ${cfg.access_token}` }, signal: controller.signal }
+      );
+      clearTimeout(tid);
+      const data = await resp.json();
+      if (!resp.ok) {
+        const errCode = data.error?.code;
+        // 131031 = account locked, 368 = policy block, 190 = invalid/expired token
+        if (errCode === 131031 || errCode === 368) {
+          waManager.markBanned(tenantId, `Auto-detected (code ${errCode}): ${data.error?.message || 'Account blocked'}`);
+        } else if (errCode === 190) {
+          // Access token invalid/expired — push admin notice only, don't mark banned
+          pushAdminNotif('warn', `API ${tenantId}: Access token expired or invalid (code 190). Please reconfigure.`, tenantId, null);
+          broadcastToAdmin('api_token_expired', { tenant_id: Number(tenantId) });
+        }
+      } else {
+        // Check if phone number status is explicitly BANNED, RESTRICTED etc.
+        const phStatus = (data.status || '').toUpperCase();
+        if (phStatus === 'BANNED' || phStatus === 'BLOCKED') {
+          waManager.markBanned(tenantId, `Auto-detected: Phone number status is ${phStatus}`);
+        } else if (phStatus === 'FLAGGED' || phStatus === 'RESTRICTED') {
+          // Not banned yet but at risk — push a warning to admin
+          pushAdminNotif('warn', `API ${tenantId}: Phone number status is ${phStatus} — risk of ban`, tenantId, null);
+          broadcastToAdmin('api_flagged', { tenant_id: Number(tenantId), status: phStatus });
+        }
+      }
+    } catch (err) {
+      if (!isAbortError(err)) {
+        console.warn(`⚠️  Proactive ban check failed for tenant ${tenantId}:`, err.message);
+      }
+    }
+  }
+}
+
+// ── Manual: Admin triggers check-all-apis ───────────────────
+app.post('/api/admin/check-all-apis', adminAuth, async (req, res) => {
+  // Run the check immediately in background; respond right away so UI isn't blocked
+  proactiveBanCheck().catch(() => {});
+  res.json({ ok: true, message: `Checking ${waManager.configs.size} API(s) in background. Results appear instantly via real-time events.` });
 });
 
 // ── Active Chats (OPTIMIZED: 3 queries instead of N*2+1) ────
@@ -3503,7 +3595,12 @@ const server = app.listen(PORT, () => {
   console.log('');
 
   runStartupMigrations().catch(() => {}).then(() => {
-    initAllTenants();
+    initAllTenants().then(() => {
+      // After all tenant configs are loaded, immediately check all APIs for ban status
+      // Then run every 3 minutes in background
+      setTimeout(() => proactiveBanCheck().catch(() => {}), 5000);
+      setInterval(() => proactiveBanCheck().catch(() => {}), 3 * 60 * 1000);
+    });
     // Start Supabase Realtime subscription at boot so incoming messages
     // are tracked even before any CRM tab connects via SSE
     startRealtimeSubscription();

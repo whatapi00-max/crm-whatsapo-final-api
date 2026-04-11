@@ -48,11 +48,77 @@ loadStats();
 loadStorageStats();
 loadDashboard();
 checkNotifBadge();
+startAdminRealtime();
 setInterval(() => { if (!document.hidden) loadTenants(); }, 120000);
 setInterval(() => { if (!document.hidden) loadStats(); }, 120000);
 setInterval(() => { if (!document.hidden) loadStorageStats(); }, 300000);
 setInterval(() => { if (!document.hidden) loadDashboard(); }, 180000);
 setInterval(() => { if (!document.hidden) checkNotifBadge(); }, 120000);
+
+// ── Admin Real-time SSE ──────────────────────
+// Connects to /api/admin/events and handles instant ban/flag notifications
+let adminSseSource = null;
+let adminSseRetryTimer = null;
+
+function startAdminRealtime() {
+  if (adminSseSource) { adminSseSource.close(); adminSseSource = null; }
+  if (adminSseRetryTimer) { clearTimeout(adminSseRetryTimer); adminSseRetryTimer = null; }
+
+  const es = new EventSource('/api/admin/events');
+  adminSseSource = es;
+
+  es.addEventListener('connected', () => {
+    console.log('⚡ Admin SSE connected');
+  });
+
+  // A tenant's WhatsApp number has been banned — update UI immediately
+  es.addEventListener('tenant_banned', (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      const tid = data.tenant_id;
+      // Update in-memory tenant record so renderTenants() shows correct badge
+      const t = tenants.find(x => x.id === tid);
+      if (t) {
+        t.wa_status = 'banned';
+        t.wa_banned = true;
+        renderTenants();
+        loadStats();
+      } else {
+        // Tenant not loaded yet — do a fresh fetch
+        loadTenants();
+      }
+      toast(`🚫 API ${tid} BANNED! ${data.reason || ''}`, 'error');
+    } catch (_) {
+      toast('🚫 A WhatsApp API has been BANNED!', 'error');
+      loadTenants();
+    }
+  });
+
+  // A tenant's token expired — update UI badge immediately
+  es.addEventListener('api_token_expired', (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      const tid = data.tenant_id;
+      const t = tenants.find(x => x.id === tid);
+      if (t) { t.wa_status = 'not_configured'; renderTenants(); }
+      toast(`⚠️ API ${tid}: Access token expired. Reconfigure needed.`, 'warning');
+    } catch (_) {}
+  });
+
+  // A tenant's number is flagged/restricted — warning only
+  es.addEventListener('api_flagged', (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      toast(`⚠️ API ${data.tenant_id}: Phone number status is ${data.status} — risk of ban!`, 'warning');
+    } catch (_) {}
+  });
+
+  es.onerror = () => {
+    es.close();
+    adminSseSource = null;
+    adminSseRetryTimer = setTimeout(startAdminRealtime, 15000);
+  };
+}
 
 // ── API Helpers ─────────────────────────────
 async function api(url, opts = {}) {
@@ -97,6 +163,20 @@ async function loadStats() {
 function updateCountBadge() {
   const el = document.getElementById('tenant-count-badge');
   if (el) el.textContent = `${tenants.length} total`;
+}
+
+// ── Check All APIs (manual trigger) ─────────
+async function checkAllApis() {
+  const btn = document.getElementById('btn-check-apis');
+  if (btn) { btn.disabled = true; btn.textContent = 'Checking...'; }
+  try {
+    const result = await api('/api/admin/check-all-apis', { method: 'POST' });
+    toast(result.message || 'Check triggered — watch for real-time updates.', 'success');
+  } catch (err) {
+    toast('Check all APIs failed: ' + err.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg> Check All APIs'; }
+  }
 }
 
 // ── Search / Filter ─────────────────────────
