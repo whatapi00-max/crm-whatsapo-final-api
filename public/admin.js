@@ -179,6 +179,9 @@ async function checkAllApis() {
   }
 }
 
+// Ensure inline onclick handlers can always resolve this function.
+window.checkAllApis = checkAllApis;
+
 // ── Search / Filter ─────────────────────────
 function filterTenants() {
   const q = (document.getElementById('search-input').value || '').toLowerCase().trim();
