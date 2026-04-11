@@ -44,19 +44,6 @@ function toggleTheme() {
   }
 })();
 
-// ── Initial Load ────────────────────────────
-loadTenants();
-loadStats();
-loadStorageStats();
-loadDashboard();
-checkNotifBadge();
-startAdminRealtime();
-setInterval(() => { if (!document.hidden) loadTenants(); }, 120000);
-setInterval(() => { if (!document.hidden) loadStats(); }, 120000);
-setInterval(() => { if (!document.hidden) loadStorageStats(); }, 300000);
-setInterval(() => { if (!document.hidden) loadDashboard(); }, 180000);
-setInterval(() => { if (!document.hidden) checkNotifBadge(); }, 120000);
-
 // ── Admin Real-time SSE ──────────────────────
 // Connects to /api/admin/events and handles instant ban/flag notifications
 let adminSseSource = null;
@@ -183,6 +170,23 @@ async function checkAllApis() {
 
 // Ensure inline onclick handlers can always resolve this function.
 window.checkAllApis = checkAllApis;
+
+// ── Initial Load ────────────────────────────
+// Run startup after the current script finishes evaluating, so all `let` bindings
+// are initialized and we avoid TDZ errors on hard refresh.
+setTimeout(() => {
+  loadTenants();
+  loadStats();
+  loadStorageStats();
+  loadDashboard();
+  checkNotifBadge();
+  startAdminRealtime();
+  setInterval(() => { if (!document.hidden) loadTenants(); }, 120000);
+  setInterval(() => { if (!document.hidden) loadStats(); }, 120000);
+  setInterval(() => { if (!document.hidden) loadStorageStats(); }, 300000);
+  setInterval(() => { if (!document.hidden) loadDashboard(); }, 180000);
+  setInterval(() => { if (!document.hidden) checkNotifBadge(); }, 120000);
+}, 0);
 
 // ── Search / Filter ─────────────────────────
 function filterTenants() {
