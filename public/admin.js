@@ -6,6 +6,8 @@ let pendingDeleteId = null;
 let lastCreatedCreds = null;
 let bulkCreatedCreds = [];
 let toastCounter = 0;
+const TOAST_ICONS = { success: '✅', error: '❌', warning: '⚠️', info: 'ℹ️' };
+const TOAST_TITLES = { success: 'Success', error: 'Error', warning: 'Warning', info: 'Info' };
 
 // ── Global Error Handlers — catch ANY uncaught errors ──
 window.addEventListener('error', (event) => {
@@ -1153,11 +1155,13 @@ function copyText(text, msg) {
   navigator.clipboard.writeText(text).then(() => toast(msg || 'Copied!', 'success'));
 }
 
-const TOAST_ICONS = { success: '✅', error: '❌', warning: '⚠️', info: 'ℹ️' };
-const TOAST_TITLES = { success: 'Success', error: 'Error', warning: 'Warning', info: 'Info' };
-
 function toast(msg, type = 'success') {
   const container = document.getElementById('toast-container');
+  if (!container) {
+    // Fallback to console so UI never crashes if toast container is not ready yet.
+    console[type === 'error' ? 'error' : 'log']('[toast]', msg);
+    return;
+  }
   const id = ++toastCounter;
   const icon = TOAST_ICONS[type] || 'ℹ️';
   const title = TOAST_TITLES[type] || 'Notice';
