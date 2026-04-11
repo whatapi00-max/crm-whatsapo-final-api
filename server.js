@@ -2322,12 +2322,6 @@ app.post('/api/send-voice', tenantAuth, sendLimiter, upload.single('audio'), asy
       return res.status(400).json({ error: 'Invalid phone number format' });
     }
 
-    // 🛡️ SpamGuard: check BEFORE sending to WhatsApp
-    const spam = spamCheck(req.tenantId, cleanedPhone, '🎤 Voice message');
-    if (!spam.allowed) {
-      return res.status(429).json({ error: spam.reason, spam_frozen: true });
-    }
-
     // Upload audio to WhatsApp Media API
     const mimeType = req.file.mimetype || 'audio/ogg';
     const mediaId = await waManager.uploadMedia(req.tenantId, req.file.buffer, mimeType);
