@@ -184,6 +184,7 @@ function setAutoReplyCache(tenantId, rules) {
 }
 function invalidateAutoReplyCache(tenantId) {
   autoReplyCache.delete(String(tenantId));
+  responseCache.delete(`auto_replies_${tenantId}`);
 }
 
 // ── Quick-Reply Cache (avoid DB query on every page load) ──
@@ -257,6 +258,7 @@ class CloudAPIManager {
   markBanned(tenantId, reason) {
     const cfg = this.getConfig(tenantId);
     if (cfg) {
+      if (cfg.banned) return; // already banned — skip redundant DB writes, SSE broadcasts, and admin notifs
       cfg.banned = true;
       cfg.banned_reason = reason || 'Unknown';
       cfg.banned_at = new Date().toISOString();
@@ -1873,7 +1875,7 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
       total_leads: leadsRes.count || 0,
       messages_today: msgsRes.count || 0
     };
-    setCachedResponse(cacheKey, result, 120000);
+    setCachedResponse(cacheKey, result, 300000); // 5 min — count queries are expensive at scale
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch admin stats' });
@@ -1893,7 +1895,7 @@ app.get('/api/admin/tenants/:id/stats', adminAuth, async (req, res) => {
         .eq('tenant_id', id).eq('direction', 'outgoing').gte('created_at', new Date(Date.now() - 86400000).toISOString())
     ]);
     const result = { leads: leadsRes.count || 0, messages_today: msgsRes.count || 0 };
-    setCachedResponse(cacheKey, result, 60000); // 60s cache
+    setCachedResponse(cacheKey, result, 180000); // 3 min cache
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch tenant stats' });
@@ -1954,7 +1956,7 @@ app.get('/api/admin/storage', adminAuth, async (req, res) => {
       },
       uptime_seconds: Math.floor(process.uptime()),
     };
-    setCachedResponse('admin_storage', storageResult, 120000);
+    setCachedResponse('admin_storage', storageResult, 300000); // 5 min
     res.json(storageResult);
   } catch (err) {
     console.error('Storage stats error:', err.message);
@@ -2001,7 +2003,7 @@ app.get('/api/admin/storage/tenants', adminAuth, async (req, res) => {
     }));
 
     breakdown.sort((a, b) => b.total_rows - a.total_rows);
-    setCachedResponse(cacheKey, breakdown, 300000); // 5 min — storage doesn't change rapidly
+    setCachedResponse(cacheKey, breakdown, 900000); // 15 min — storage doesn't change rapidly
     res.json(breakdown);
   } catch (err) {
     console.error('Tenant storage breakdown error:', err.message);
@@ -2055,7 +2057,7 @@ app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
         supabase.from('conversations').select('id', { count: 'exact', head: true })
           .eq('tenant_id', t.id).eq('direction', 'outgoing').gte('created_at', oneDayAgo),
         supabase.from('conversations').select('created_at')
-          .eq('tenant_id', t.id).eq('direction', 'outgoing').gte('created_at', sevenDaysAgo),
+          .eq('tenant_id', t.id).eq('direction', 'outgoing').gte('created_at', sevenDaysAgo).limit(700),
         supabase.from('conversations').select('id', { count: 'exact', head: true })
           .eq('tenant_id', t.id).eq('direction', 'incoming').gte('created_at', oneDayAgo),
       ]);
@@ -2124,7 +2126,7 @@ app.get('/api/admin/marketer-dashboard', adminAuth, async (req, res) => {
       total_messages_week: marketers.reduce((s, m) => s + m.stats.messages_week, 0),
       copy_paste_alerts: marketers.filter(m => m.copy_paste_warning).length,
     };
-    setCachedResponse(cacheKey, result, 300000); // 5 min — admin dashboard is expensive, refresh rarely
+    setCachedResponse(cacheKey, result, 600000); // 10 min — expensive query, cache longer to reduce DB load
     res.json(result);
   } catch (err) {
     if (!isAbortError(err)) console.error('Dashboard error:', err.message);
@@ -2685,7 +2687,7 @@ app.get('/api/stats', tenantAuth, async (req, res) => {
       supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('status', 'interested'),
       supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('status', 'contacted'),
       supabase.from('leads').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('status', 'lost'),
-      supabase.from('leads').select('revenue').eq('tenant_id', tid).gt('revenue', 0).limit(3000), // capped — avoids unbounded row fetch
+      supabase.from('leads').select('revenue').eq('tenant_id', tid).gt('revenue', 0).limit(500), // capped — avoids unbounded row fetch
       supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).gte('created_at', since24h),
       supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('direction', 'incoming').gte('created_at', since24h),
       supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('tenant_id', tid).eq('direction', 'outgoing').gte('created_at', since24h),
@@ -2703,7 +2705,7 @@ app.get('/api/stats', tenantAuth, async (req, res) => {
       incoming_today: incomingToday.count || 0,
       outgoing_today: outgoingToday.count || 0
     };
-    setCachedResponse(cacheKey, result);
+    setCachedResponse(cacheKey, result, 120000); // 2 min — reduce DB load under heavy concurrency
     res.set('Cache-Control', 'private, max-age=30');
     res.json(result);
   } catch (err) {
@@ -2810,10 +2812,15 @@ app.delete('/api/quick-replies/:id', tenantAuth, async (req, res) => {
 // ── Auto-Replies CRUD ───────────────────────
 app.get('/api/auto-replies', tenantAuth, async (req, res) => {
   try {
+    const cacheKey = `auto_replies_${req.tenantId}`;
+    const cached = getCachedResponse(cacheKey);
+    if (cached) return res.json(cached);
     const { data, error } = await supabase.from('auto_replies')
       .select('*').eq('tenant_id', req.tenantId).order('priority', { ascending: false });
     if (error) throw error;
-    res.json(data || []);
+    const result = data || [];
+    setCachedResponse(cacheKey, result, 60000); // 60s cache
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch auto-replies' });
   }
@@ -3404,11 +3411,16 @@ app.get('/api/active-chats', tenantAuth, async (req, res) => {
     const tid = req.tenantId;
     const since = req.query.since || null; // ISO timestamp for incremental updates
 
-    // Cache full loads (no 'since') for 5s to prevent rapid re-fetches
+    // Cache full loads (no 'since') for 10s to prevent rapid re-fetches
     if (!since) {
       const cacheKey = `active_chats_${tid}`;
       const cached = getCachedResponse(cacheKey);
       if (cached) { res.set('Cache-Control', 'private, max-age=5'); return res.json(cached); }
+    } else {
+      // Cache incremental (since) queries per tenant for 8s — prevents 33 marketers hammering DB every 45s
+      const incKey = `active_chats_inc_${tid}`;
+      const incCached = getCachedResponse(incKey);
+      if (incCached) { res.set('Cache-Control', 'private, max-age=5'); return res.json(incCached); }
     }
 
     // If client sends 'since', return only leads updated after that time
@@ -3436,16 +3448,20 @@ app.get('/api/active-chats', tenantAuth, async (req, res) => {
       .limit(Math.max(phones.length * 5, 600));
     if (msgErr) console.error('⚠️  Active chats recentMsgs error:', msgErr.message);
 
-    // Batch: get unread counts for all phones in ONE query
+    // Batch: get unread counts — skip on incremental (since) requests to save 1 DB query per poll
     // Limit to 2000 to prevent runaway scans on tenants with large unread backlogs
-    const { data: unreadRows, error: unreadErr } = await supabase.from('conversations')
-      .select('phone')
-      .eq('tenant_id', tid)
-      .in('phone', phones)
-      .eq('direction', 'incoming')
-      .eq('status', 'received')
-      .limit(2000);
-    if (unreadErr) console.error('⚠️  Active chats unreadRows error:', unreadErr.message);
+    let unreadRows = [];
+    if (!since) {
+      const { data: unreadData, error: unreadErr } = await supabase.from('conversations')
+        .select('phone')
+        .eq('tenant_id', tid)
+        .in('phone', phones)
+        .eq('direction', 'incoming')
+        .eq('status', 'received')
+        .limit(2000);
+      if (unreadErr) console.error('⚠️  Active chats unreadRows error:', unreadErr.message);
+      unreadRows = unreadData || [];
+    }
 
     // Build lookup maps
     const lastMsgMap = new Map();
@@ -3470,6 +3486,9 @@ app.get('/api/active-chats', tenantAuth, async (req, res) => {
       setCachedResponse(`active_chats_${tid}`, chats, 10000);
       // Always update stale fallback so marketers get last-known-good data during outages
       setStaleCachedResponse(`active_chats_stale_${tid}`, chats);
+    } else {
+      // Cache incremental result so other tabs of same tenant skip the DB for 8s
+      setCachedResponse(`active_chats_inc_${tid}`, chats, 8000);
     }
     res.json(chats);
   } catch (err) {
