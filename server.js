@@ -1632,7 +1632,10 @@ app.get('/api/admin/tenants', adminAuth, async (req, res) => {
     res.json(tenants);
   } catch (err) {
     console.error('Failed to fetch tenants:', err.message);
-    pushAdminNotif('error', `Load marketers failed: ${err.message}`, null, 'Admin');
+    // Only notify admin for non-timeout errors (AbortError is usually transient)
+    if (!isAbortError(err)) {
+      pushAdminNotif('error', `Load marketers failed: ${err.message}`, null, 'Admin');
+    }
     res.status(500).json({ error: 'Failed to fetch tenants' });
   }
 });
