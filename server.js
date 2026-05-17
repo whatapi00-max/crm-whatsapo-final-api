@@ -935,7 +935,14 @@ const globalSchedulerInterval = setInterval(async () => {
       .lte('scheduled_at', new Date().toISOString())
       .order('scheduled_at', { ascending: true }).limit(20);
 
-    if (pendErr) { console.error('⚠️  Scheduler DB error:', pendErr.message); pushAdminNotif('error', `Scheduler DB error: ${pendErr.message}`, null, 'System'); return; }
+    if (pendErr) {
+      console.error('⚠️  Scheduler DB error:', pendErr.message);
+      // Only notify admin for non-timeout errors (AbortError is usually transient)
+      if (!isAbortError(pendErr)) {
+        pushAdminNotif('error', `Scheduler DB error: ${pendErr.message}`, null, 'System');
+      }
+      return;
+    }
     if (!pending || pending.length === 0) return;
 
     for (const sm of pending) {
